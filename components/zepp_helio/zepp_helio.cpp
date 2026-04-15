@@ -18,6 +18,7 @@
 #include <esp_bt_main.h>
 #include <esp_gap_ble_api.h>
 #include <esp_gatt_common_api.h>
+#include <esp_gattc_api.h>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -379,32 +380,35 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
       ESP_LOGI(TAG, "service discovery complete, resolving chars");
       notify_registered_count_ = 0;
 
-      // Huami service: standard 16-bit FEE1
-      auto svc = esp32_ble_tracker::ESPBTUUID::from_uint16(0xFEE1);
-      auto chunked_write = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000016-0000-3512-2118-0009af100700");
-      auto chunked_read = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000017-0000-3512-2118-0009af100700");
-      auto act_ctrl = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000004-0000-3512-2118-0009af100700");
-      auto act_data = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000005-0000-3512-2118-0009af100700");
+      // Scan the entire handle range for each char UUID (matches bleak's
+      // global-by-UUID behaviour in test.py). Zepp OS devices parent the
+      // chunked chars under a custom service, not the legacy 0xFEE1.
+      uint16_t conn_id = param->search_cmpl.conn_id;
+      auto find_char = [&](const char *uuid_str) -> uint16_t {
+        auto bt_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(uuid_str).get_uuid();
+        esp_gattc_char_elem_t elem{};
+        uint16_t cnt = 1;
+        esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(
+            gattc_if, conn_id, 0x0001, 0xFFFF, bt_uuid, &elem, &cnt);
+        if (st == ESP_GATT_OK && cnt > 0) return elem.char_handle;
+        return 0;
+      };
 
-      auto *cw = this->parent()->get_characteristic(svc, chunked_write);
-      auto *cr = this->parent()->get_characteristic(svc, chunked_read);
-      auto *ac = this->parent()->get_characteristic(svc, act_ctrl);
-      auto *ad = this->parent()->get_characteristic(svc, act_data);
-      if (cw == nullptr || cr == nullptr || ad == nullptr ||
-          (!use_zeppos_control_ && ac == nullptr)) {
-        ESP_LOGE(TAG, "missing char: cw=%p cr=%p ac=%p ad=%p",
-                 (void*)cw, (void*)cr, (void*)ac, (void*)ad);
+      h_chunked_write_ = find_char("00000016-0000-3512-2118-0009af100700");
+      h_chunked_read_  = find_char("00000017-0000-3512-2118-0009af100700");
+      h_act_control_   = find_char("00000004-0000-3512-2118-0009af100700");
+      h_act_data_      = find_char("00000005-0000-3512-2118-0009af100700");
+
+      bool missing = (h_chunked_write_ == 0 || h_chunked_read_ == 0 ||
+                      h_act_data_ == 0 ||
+                      (!use_zeppos_control_ && h_act_control_ == 0));
+      if (missing) {
+        ESP_LOGE(TAG, "missing char handle: cw=0x%04X cr=0x%04X ac=0x%04X ad=0x%04X",
+                 h_chunked_write_, h_chunked_read_,
+                 h_act_control_, h_act_data_);
         finish_and_disconnect_(false);
         return;
       }
-      h_chunked_write_ = cw->handle;
-      h_chunked_read_  = cr->handle;
-      h_act_data_      = ad->handle;
-      h_act_control_   = (ac != nullptr) ? ac->handle : 0;
       ESP_LOGI(TAG, "handles cw=0x%04X cr=0x%04X ac=0x%04X ad=0x%04X "
                     "(control_path=%s)",
                h_chunked_write_, h_chunked_read_, h_act_control_, h_act_data_,
