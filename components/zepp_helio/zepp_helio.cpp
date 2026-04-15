@@ -18,7 +18,7 @@
 #include <esp_bt_main.h>
 #include <esp_gap_ble_api.h>
 #include <esp_gatt_common_api.h>
-#include <mbedtls/aes.h>
+#include "hwcrypto/aes.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -52,23 +52,23 @@ static bool is_huami_uuid(const esp_bt_uuid_t &uuid, uint16_t short_id) {
 static void aes_ecb_encrypt_block(const uint8_t key[16],
                                   const uint8_t *in, size_t nblocks,
                                   uint8_t *out) {
-  mbedtls_aes_context ctx;
-  mbedtls_aes_init(&ctx);
-  mbedtls_aes_setkey_enc(&ctx, key, 128);
+  esp_aes_context ctx;
+  esp_aes_init(&ctx);
+  esp_aes_setkey(&ctx, key, 128);
   for (size_t i = 0; i < nblocks; i++)
-    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, in + i * 16, out + i * 16);
-  mbedtls_aes_free(&ctx);
+    esp_aes_crypt_ecb(&ctx, ESP_AES_ENCRYPT, in + i * 16, out + i * 16);
+  esp_aes_free(&ctx);
 }
 
 static void aes_ecb_decrypt_block(const uint8_t key[16],
                                   const uint8_t *in, size_t nblocks,
                                   uint8_t *out) {
-  mbedtls_aes_context ctx;
-  mbedtls_aes_init(&ctx);
-  mbedtls_aes_setkey_dec(&ctx, key, 128);
+  esp_aes_context ctx;
+  esp_aes_init(&ctx);
+  esp_aes_setkey(&ctx, key, 128);
   for (size_t i = 0; i < nblocks; i++)
-    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, in + i * 16, out + i * 16);
-  mbedtls_aes_free(&ctx);
+    esp_aes_crypt_ecb(&ctx, ESP_AES_DECRYPT, in + i * 16, out + i * 16);
+  esp_aes_free(&ctx);
 }
 
 static void derive_message_key(const uint8_t session_key[16],
