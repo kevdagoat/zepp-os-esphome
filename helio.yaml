@@ -27,9 +27,12 @@ time:
     id: sntp_time
 
 external_components:
-  - source:
-      type: local
-      path: components
+  - source: github://kevdagoat/zepp-os-esphome@main
+    components: [ zepp_helio ]
+    # For local development, swap the above for:
+    # - source:
+    #     type: local
+    #     path: components
 
 esp32_ble_tracker:
   scan_parameters:

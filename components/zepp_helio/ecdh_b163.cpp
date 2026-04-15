@@ -6,6 +6,7 @@
 
 #include "ecdh_b163.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include <cstring>
 
 namespace esphome {
