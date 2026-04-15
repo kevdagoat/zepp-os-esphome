@@ -56,6 +56,41 @@ zepp_helio:
   #             Gadgetbridge's ZeppOsActivityFetchService). Use this if
   #             future firmware drops the legacy backdoor.
   control_path: legacy
+  # Hard safety cap on how far back we go when the NVS-persisted
+  # last_import_ts for a type has stale / corrupted state. Steady-
+  # state windows are driven by last_import_ts, not this value.
+  max_lookback: 24h
+  # First-run backfill window — how far back we go when NVS has no
+  # prior last_import_ts for a type (fresh flash, factory reset).
+  # Every record in this window is bucketed into 5-min aggregates and
+  # pushed to HA via recorder.import_statistics through the trigger
+  # below.
+  first_run_lookback: 24h
+
+  # Per-bucket statistic trigger: fires once per 5-min aggregate with
+  # (type, start_iso, mean_value, min_value, max_value, count). Wire
+  # each bucket into HA's external statistics store so historical
+  # charts back-populate on first run.
+  on_statistic_ready:
+    - homeassistant.service:
+        service: recorder.import_statistics
+        data:
+          statistic_id: !lambda 'return std::string("esphome:helio_") + type;'
+          source: esphome
+          name: !lambda 'return std::string("Helio ") + type;'
+          has_mean: "true"
+          has_sum: "false"
+        data_template:
+          # data_template values get Jinja2-rendered by HA. Wrapping
+          # the list in {{ ... }} makes HA evaluate it as a Python
+          # literal and pass it to recorder.import_statistics as a
+          # real list[dict], which is what the service expects.
+          stats: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+              "{{ [{'start':'%s','mean':%.3f,'min':%.3f,'max':%.3f}] }}",
+              start.c_str(), mean_value, min_value, max_value);
+            return std::string(buf);
 
 sensor:
   - platform: zepp_helio

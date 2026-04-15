@@ -99,6 +99,100 @@ has `kind` == `NOT_WORN` / `CHARGING` / `UNSET`, those cache slots are
 not updated — last-known-valid value is retained instead of being
 overwritten with an off-wrist `0xFF`.
 
+### Incremental fetch (per-type `last_seen` state)
+
+The firmware keeps an in-RAM `last_seen[type]` timestamp and uses
+`max(last_seen + 1s, now - max_lookback)` as the `since` for each
+fetch. Steady-state behavior:
+
+- **First cycle after boot** pulls one `max_lookback` window per type
+  (default 24 h). On Helio this is ~7.5 kB for activity + temperature
+  combined, a few hundred bytes for everything else.
+- **Every subsequent cycle** pulls only the records that are newer
+  than the last one we saw — typically seconds of wall-clock data,
+  not the full 15 min poll interval. Wire traffic drops to near zero
+  for sparse types (HRV, resting HR, max HR) that haven't updated.
+- **`latest_` cache is NOT cleared between cycles**, so if a type
+  returns zero records this cycle, the sensor stays at its last
+  published value instead of disappearing.
+
+`max_lookback` is a YAML knob (default `24h`) — it's a safety cap
+that only matters on a cold boot or if the ESP32 has been offline
+long enough that the device has rolled old data off its internal
+ring buffer. In normal operation each type's actual window is
+driven by `last_seen`, not this value.
+
+### Historical backfill → HA `recorder.import_statistics`
+
+On first flash the firmware can backfill Home Assistant's historical
+charts via 5-minute-bucketed external statistics. Config:
+
+```yaml
+zepp_helio:
+  first_run_lookback: 24h    # how far back to pull on a fresh flash
+  on_statistic_ready:
+    - homeassistant.service:
+        service: recorder.import_statistics
+        data:
+          statistic_id: !lambda 'return std::string("esphome:helio_") + type;'
+          source: esphome
+          name: !lambda 'return std::string("Helio ") + type;'
+          has_mean: "true"
+          has_sum: "false"
+        data_template:
+          stats: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+              "{{ [{'start':'%s','mean':%.3f,'min':%.3f,'max':%.3f}] }}",
+              start.c_str(), mean_value, min_value, max_value);
+            return std::string(buf);
+```
+
+**How it works:**
+
+1. **Per-type `last_import_ts`** is persisted to ESP32 NVS. Zero means
+   "never imported" → next fetch uses `first_run_lookback`. Non-zero
+   means steady-state delta → `since = last_import_ts + 1s`.
+2. **During parse**, each numeric record lands in a 5-minute bucket
+   accumulator (`active_buckets_` map keyed on `ts / 300 * 300`).
+   Activity contributes `hr` (the chart-worthy field).
+3. **At end of each type**, buckets are flattened into `pending_stats_`
+   with `{type, start_iso, mean, min, max, count, type_idx}`.
+4. **`loop()` pumps** one `PendingStat` through all registered triggers
+   per 100 ms — keeps HA's API queue from backing up on a first-run
+   dump (24h × 60/5 × 2 per-minute types ≈ 576 calls ≈ ~1 min pump).
+5. **After the pending queue drains**, `last_import_ts_[i]` for every
+   type that contributed buckets this cycle is committed to NVS via
+   `ESPPreferenceObject::save` + `global_preferences->sync()`.
+6. **On the HA side**, `stats` is sent as a `data_template` value
+   wrapped in `{{ … }}` so HA's Jinja2 renderer evaluates the string
+   into a real `list[dict]` before `recorder.import_statistics`
+   receives it.
+
+**Statistics IDs land as `esphome:helio_<type>`** in HA's external
+statistics store (visible in Developer Tools → Statistics and the
+Long-term Statistics card on dashboards). They are **not attached to
+the `sensor.helio_*` entities** — HA treats external statistics as a
+separate namespace. That's a limitation of `import_statistics` with
+`source: esphome`, not something the component can fix.
+
+**What gets bucketed:**
+
+| Type | Statistic ID | Bucketed value |
+|------|-------------|----------------|
+| `heart_rate` (0x01) | `esphome:helio_heart_rate` | HR from activity record (worn + non-sentinel only) |
+| `stress` (0x13) | `esphome:helio_stress` | stress byte (0xFF skipped) |
+| `spo2` (0x25) | `esphome:helio_spo2` | parsed SpO2 % |
+| `temperature` (0x2E) | `esphome:helio_temperature` | skin temp in °C |
+| `respiratory_rate` (0x38) | `esphome:helio_respiratory_rate` | rate byte |
+| `resting_heart_rate` (0x3A) | `esphome:helio_resting_heart_rate` | HR byte |
+| `max_heart_rate` (0x3D) | `esphome:helio_max_heart_rate` | HR byte |
+| `hrv` (0x49) | `esphome:helio_hrv` | HRV byte |
+
+Text/binary sensors (sleep_stage, worn, activity_kind, charging) are
+not bucketed — `import_statistics` only accepts numeric mean/min/max.
+Those continue to publish as regular `latest_` cache values only.
+
 ### Binary sensors (`binary_sensor:`)
 
 | Sensor     | Source                              | True when                                        |

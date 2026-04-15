@@ -6,8 +6,12 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/time/real_time_clock.h"
+#include "esphome/core/preferences.h"
+#include "esphome/core/automation.h"
+#include <string>
 #include <vector>
 #include <array>
+#include <map>
 
 namespace esphome {
 namespace zepp_helio {
@@ -65,6 +69,15 @@ inline const char *huami_kind_to_sleep_stage(uint8_t k) {
   }
 }
 
+class ZeppHelio;
+
+class StatisticReadyTrigger
+    : public Trigger<std::string, std::string, float, float, float, uint32_t> {
+  friend class ZeppHelio;
+ public:
+  explicit StatisticReadyTrigger(ZeppHelio *parent);
+};
+
 enum class State : uint8_t {
   IDLE,
   CONNECTING,
@@ -96,6 +109,14 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   }
   void set_time(time::RealTimeClock *t) { time_ = t; }
   void set_use_zeppos_control(bool v) { use_zeppos_control_ = v; }
+  void set_max_lookback(uint32_t seconds) { max_lookback_s_ = seconds; }
+  void set_first_run_lookback(uint32_t seconds) { first_run_lookback_s_ = seconds; }
+
+  // Register an on_statistic_ready trigger (called once per declared handler).
+  void add_statistic_ready_trigger(
+      Trigger<std::string, std::string, float, float, float, uint32_t> *t) {
+    stat_triggers_.push_back(t);
+  }
   void set_temperature_sensor(sensor::Sensor *s) { temp_sensor_ = s; }
   void set_heart_rate_sensor(sensor::Sensor *s) { hr_sensor_ = s; }
   void set_resting_hr_sensor(sensor::Sensor *s) { resting_hr_sensor_ = s; }
@@ -123,6 +144,40 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   void handle_auth_reply_(const uint8_t *payload, int len);
   void request_battery_();
   void handle_battery_reply_(const uint8_t *payload, int len);
+
+  // Historical backfill (option 2): bucket raw records into 5-min
+  // windows, emit one trigger per bucket.
+  static constexpr uint32_t BUCKET_SECONDS = 300;  // 5 min
+
+  struct Bucket {
+    time_t start_ts;
+    uint32_t count;
+    double sum;
+    double min_v;
+    double max_v;
+  };
+
+  struct PendingStat {
+    std::string type;      // short name (e.g. "temperature")
+    std::string start_iso; // RFC3339 UTC
+    float mean;
+    float min_v;
+    float max_v;
+    uint32_t count;
+    size_t type_idx;       // for NVS commit after all pending drained
+  };
+
+  // Per-type bucket accumulator used during parse_buffer_for_type_.
+  // Key: bucket start ts (seconds since epoch, aligned to BUCKET_SECONDS).
+  std::map<time_t, Bucket> active_buckets_;
+
+  void bucket_add_(time_t ts, double v);
+  void flush_buckets_for_type_(uint8_t huami_code, size_t type_idx);
+  void format_iso8601_utc_(time_t ts, std::string &out);
+  const char *huami_type_short_name_(uint8_t huami_code);
+  void pump_pending_stats_();
+  void load_last_import_ts_();
+  void save_last_import_ts_(size_t idx);
   void send_session_key_();
   void begin_legacy_fetch_();
   void on_control_notify_(const uint8_t *data, uint16_t len);
@@ -255,6 +310,33 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   };
   size_t current_type_idx_{0};
   uint8_t current_type_{0};
+
+  // Per-type "last seen" timestamps (seconds since epoch). Next fetch
+  // uses max(last_seen+1, now - max_lookback) as since. Zero means
+  // "first run — fall back to max_lookback". Kept in RAM only, so a
+  // reboot re-fetches one max_lookback window.
+  std::array<time_t, 8> last_seen_{};
+
+  // Hard ceiling on how far back we go when last_seen is zero or stale.
+  // Default 24 h — catches sparse types after boot; steady-state fetch
+  // windows are driven by last_seen and land in seconds, not hours.
+  time_t max_lookback_s_{24 * 3600};
+
+  // Persisted per-type "last successfully emitted statistic" ts.
+  // Loaded from NVS in setup(), saved after a type's bucket queue
+  // fully drains through the triggers. Zero means "nothing ever
+  // emitted" → first-run backfill uses first_run_lookback_s_.
+  std::array<uint32_t, 8> last_import_ts_{};
+  std::array<ESPPreferenceObject, 8> last_import_pref_{};
+
+  // First-run backfill window, used when last_import_ts_[i] == 0.
+  uint32_t first_run_lookback_s_{24 * 3600};
+
+  // Statistic trigger state
+  std::vector<Trigger<std::string, std::string, float, float, float, uint32_t> *> stat_triggers_;
+  std::vector<PendingStat> pending_stats_;
+  size_t pending_stats_cursor_{0};
+  uint32_t last_pending_fire_ms_{0};
 
   bool want_fetch_{false};
 };

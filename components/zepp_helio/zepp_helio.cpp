@@ -11,12 +11,15 @@
 #include "ecdh_b163.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/preferences.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 
 #include <esp_bt_main.h>
 #include <esp_gap_ble_api.h>
 #include <esp_gatt_common_api.h>
 #include <mbedtls/aes.h>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 
@@ -24,6 +27,10 @@ namespace esphome {
 namespace zepp_helio {
 
 static const char *const TAG = "zepp_helio";
+
+StatisticReadyTrigger::StatisticReadyTrigger(ZeppHelio *parent) {
+  parent->add_statistic_ready_trigger(this);
+}
 
 // Full Huami UUIDs (byte order as printed; reversed to little-endian 128)
 // 0000XXXX-0000-3512-2118-0009af100700
@@ -86,6 +93,7 @@ static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
 
 void ZeppHelio::setup() {
   ESP_LOGI(TAG, "zepp_helio setup");
+  load_last_import_ts_();
   // Request MTU 247 at link layer so chunked writes get fat chunks.
   esp_err_t st = esp_ble_gatt_set_local_mtu(247);
   if (st != ESP_OK) {
@@ -117,7 +125,11 @@ void ZeppHelio::dump_config() {
 }
 
 void ZeppHelio::loop() {
-  // Periodic state pump placeholder; real flow is event-driven in gattc cb.
+  // Periodic state pump. BLE flow is event-driven via gattc cb; the
+  // statistic pump runs independently so it drains even while a fetch
+  // is in progress or between cycles.
+  pump_pending_stats_();
+
   if (want_fetch_ && state_ == State::IDLE) {
     want_fetch_ = false;
     start_connect_();
@@ -509,7 +521,11 @@ void ZeppHelio::send_session_key_() {
 
 void ZeppHelio::begin_legacy_fetch_() {
   state_ = State::FETCH_START;
-  latest_ = LatestValues{};
+  // Do NOT clear latest_ — stale cached values from prior cycles stay
+  // published; only fields we actually see new data for this cycle get
+  // overwritten. This is what keeps HR/temp/etc. sticky when the
+  // device returns zero records for a type.
+  latest_.total_samples = 0;
   current_type_idx_ = 0;
   start_next_type_();
 }
@@ -522,9 +538,28 @@ void ZeppHelio::start_next_type_() {
   }
   current_type_ = fetch_types_[current_type_idx_];
   time_t now = time_ ? time_->now().timestamp : ::time(nullptr);
-  fetch_since_ = now - 15 * 60;
+
+  // Prefer NVS-persisted last_import_ts_ (survives reboots). Fall
+  // back to in-RAM last_seen_ if nothing has been persisted yet.
+  time_t prior = (time_t) last_import_ts_[current_type_idx_];
+  if (prior == 0) prior = last_seen_[current_type_idx_];
+
+  time_t floor_ts;
+  if (prior == 0) {
+    // First-ever run for this type → pull first_run_lookback window.
+    floor_ts = now - (time_t) first_run_lookback_s_;
+    ESP_LOGI(TAG, "type 0x%02X: first-run backfill window %u s",
+             current_type_, (unsigned) first_run_lookback_s_);
+  } else {
+    // Steady state — capped at max_lookback as a safety net.
+    floor_ts = now - (time_t) max_lookback_s_;
+  }
+  fetch_since_ = (prior > 0 && prior + 1 > floor_ts) ? (prior + 1) : floor_ts;
+
   round_num_ = 0;
-  ESP_LOGI(TAG, "fetching type 0x%02X", current_type_);
+  active_buckets_.clear();
+  ESP_LOGI(TAG, "fetching type 0x%02X since %ld (prior=%ld)",
+           current_type_, (long) fetch_since_, (long) prior);
   send_start_date_();
 }
 
@@ -636,6 +671,7 @@ void ZeppHelio::on_data_notify_(const uint8_t *d, uint16_t len) {
 void ZeppHelio::parse_round_samples_() {}  // unused, retained for ABI
 
 static int16_t rd_i16(const uint8_t *p) { int16_t v; std::memcpy(&v, p, 2); return v; }
+static uint32_t rd_u32(const uint8_t *p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 void ZeppHelio::parse_buffer_for_type_(uint8_t type,
                                        const std::vector<uint8_t> &buf,
@@ -643,20 +679,37 @@ void ZeppHelio::parse_buffer_for_type_(uint8_t type,
   const uint8_t *b = buf.data();
   size_t n = buf.size();
   size_t count = 0;
+  time_t newest_ts = last_seen_[current_type_idx_];
+
+  auto track_ts = [&](time_t t) {
+    if (t > newest_ts) newest_ts = t;
+  };
+
+  // Bucket a single numeric sample into the active 5-min window map.
+  // Only called for the "primary" value of each type (the one we
+  // expose as an HA statistic). Activity gets bucketed on hr.
+  auto bucket = [&](time_t ts, double v) {
+    if (!stat_triggers_.empty()) bucket_add_(ts, v);
+  };
 
   switch (type) {
     // Sentinel policy matches Gadgetbridge: only STRESS filters 0xFF.
     // All other types persist raw per upstream FetchXxxOperation.java.
-    case 0x2E: {  // TEMPERATURE — 8 bytes: unk16(=32767 typ), temp16, unk32
+    case 0x2E: {  // TEMPERATURE — 8 bytes: unk16, temp16, unk32
       for (size_t i = 0; i + 8 <= n; i += 8) {
         int16_t raw = rd_i16(&b[i + 2]);
-        latest_.temp = raw / 100.0f;
+        float temp_c = raw / 100.0f;
+        latest_.temp = temp_c;
         latest_.has_temp = true;
+        time_t ts = round_start + (time_t) count * 60;
+        track_ts(ts);
+        bucket(ts, temp_c);
         count++;
       }
       break;
     }
     case 0x01: {  // ACTIVITY — 4B basic or 8B extended sample.
+      size_t record_idx = 0;
       // Helio streams 8B records (FetchActivityOperation.createExtendedSample).
       // Layout: kind, intensity, steps, hr, unk, sleep, deep_sleep, rem_sleep.
       // We handle both; detection: length % 8 == 0 → extended.
@@ -681,58 +734,85 @@ void ZeppHelio::parse_buffer_for_type_(uint8_t type,
           latest_.steps = steps;
           latest_.has_steps = true;
         }
+        time_t ts = round_start + (time_t) record_idx * 60;
+        track_ts(ts);
+        // Bucket HR as the activity-type statistic (most chart-worthy).
+        if (latest_.worn && hr != 0 && hr != 0xFF) {
+          bucket(ts, (double) hr);
+        }
+        record_idx++;
         count++;
       }
       break;
     }
-    case 0x13: {  // STRESS_AUTO — 1B, 0xFF = skip per FetchStressAutoOperation
+    case 0x13: {  // STRESS_AUTO — 1B, 0xFF = skip
       for (size_t i = 0; i < n; i++) {
+        time_t ts = round_start + (time_t) i * 60;
+        // Timestamp walks forward on every byte so last_seen advances
+        // even if the whole window is skip sentinels.
+        track_ts(ts);
         if (b[i] == 0xFF) continue;
         latest_.stress = b[i];
         latest_.has_stress = true;
+        bucket(ts, (double) b[i]);
         count++;
       }
       break;
     }
-    case 0x25: {  // SPO2_NORMAL — 1B hdr (v=2) + 65B recs
+    case 0x25: {  // SPO2_NORMAL — 1B hdr (v=2) + 65B recs (ts32 @ off 0)
       if (n < 1 || b[0] != 2) { ESP_LOGW(TAG, "spo2 ver mismatch"); break; }
       for (size_t i = 1; i + 65 <= n; i += 65) {
+        time_t ts = (time_t) rd_u32(&b[i]);
+        track_ts(ts);
         int8_t raw = (int8_t) b[i + 4];
-        int v = raw < 0 ? raw + 128 : raw;  // GB: spo2raw<0 == auto flag
+        int v = raw < 0 ? raw + 128 : raw;
         latest_.spo2 = v;
         latest_.has_spo2 = true;
+        bucket(ts, (double) v);
         count++;
       }
       break;
     }
     case 0x3A: {  // RESTING_HR — 6B: ts32, tz8, hr8
       for (size_t i = 0; i + 6 <= n; i += 6) {
+        time_t ts = (time_t) rd_u32(&b[i]);
+        track_ts(ts);
         latest_.resting_hr = b[i + 5];
         latest_.has_resting_hr = true;
+        bucket(ts, (double) b[i + 5]);
         count++;
       }
       break;
     }
     case 0x3D: {  // MAX_HR — 6B: ts32, tz8, hr8
       for (size_t i = 0; i + 6 <= n; i += 6) {
+        time_t ts = (time_t) rd_u32(&b[i]);
+        track_ts(ts);
         latest_.max_hr = b[i + 5];
         latest_.has_max_hr = true;
+        bucket(ts, (double) b[i + 5]);
         count++;
       }
       break;
     }
-    case 0x38: {  // SLEEP_RESPIRATORY_RATE — 8B: ts32, tz8, rate8, unk, unk
+    case 0x38: {  // SLEEP_RESPIRATORY_RATE — 8B
       for (size_t i = 0; i + 8 <= n; i += 8) {
+        time_t ts = (time_t) rd_u32(&b[i]);
+        track_ts(ts);
         latest_.resp = b[i + 5];
         latest_.has_resp = true;
+        bucket(ts, (double) b[i + 5]);
         count++;
       }
       break;
     }
     case 0x49: {  // HRV — 6B: ts32, unk8, hrv8
       for (size_t i = 0; i + 6 <= n; i += 6) {
+        time_t ts = (time_t) rd_u32(&b[i]);
+        track_ts(ts);
         latest_.hrv = b[i + 5];
         latest_.has_hrv = true;
+        bucket(ts, (double) b[i + 5]);
         count++;
       }
       break;
@@ -744,7 +824,11 @@ void ZeppHelio::parse_buffer_for_type_(uint8_t type,
   }
   (void) round_start;
   latest_.total_samples += count;
-  ESP_LOGI(TAG, "type 0x%02X: parsed %u samples", type, (unsigned) count);
+  last_seen_[current_type_idx_] = newest_ts;
+  flush_buckets_for_type_(type, current_type_idx_);
+  ESP_LOGI(TAG, "type 0x%02X: parsed %u samples, last_seen=%ld, pending=%u",
+           type, (unsigned) count, (long) newest_ts,
+           (unsigned) pending_stats_.size());
 }
 
 void ZeppHelio::publish_latest_() {
@@ -773,6 +857,132 @@ void ZeppHelio::finish_and_disconnect_(bool ok) {
   state_ = State::IDLE;
   have_session_ = false;
   this->parent()->disconnect();
+}
+
+// ---- NVS persistence ----------------------------------------------------
+
+void ZeppHelio::load_last_import_ts_() {
+  for (size_t i = 0; i < last_import_ts_.size(); i++) {
+    uint32_t hash = 0x7E990000u | (uint32_t) i;
+    last_import_pref_[i] = global_preferences->make_preference<uint32_t>(hash);
+    uint32_t v = 0;
+    if (last_import_pref_[i].load(&v)) {
+      last_import_ts_[i] = v;
+      ESP_LOGI(TAG, "nvs load: type_idx=%u last_import_ts=%u",
+               (unsigned) i, (unsigned) v);
+    }
+  }
+}
+
+void ZeppHelio::save_last_import_ts_(size_t idx) {
+  if (idx >= last_import_ts_.size()) return;
+  uint32_t v = last_import_ts_[idx];
+  last_import_pref_[idx].save(&v);
+  global_preferences->sync();
+  ESP_LOGI(TAG, "nvs save: type_idx=%u last_import_ts=%u",
+           (unsigned) idx, (unsigned) v);
+}
+
+// ---- Bucket helpers -----------------------------------------------------
+
+void ZeppHelio::bucket_add_(time_t ts, double v) {
+  time_t bucket_start = (ts / BUCKET_SECONDS) * BUCKET_SECONDS;
+  auto it = active_buckets_.find(bucket_start);
+  if (it == active_buckets_.end()) {
+    active_buckets_[bucket_start] = Bucket{bucket_start, 1, v, v, v};
+  } else {
+    it->second.count++;
+    it->second.sum += v;
+    if (v < it->second.min_v) it->second.min_v = v;
+    if (v > it->second.max_v) it->second.max_v = v;
+  }
+}
+
+const char *ZeppHelio::huami_type_short_name_(uint8_t huami_code) {
+  switch (huami_code) {
+    case 0x01: return "heart_rate";
+    case 0x13: return "stress";
+    case 0x25: return "spo2";
+    case 0x2E: return "temperature";
+    case 0x38: return "respiratory_rate";
+    case 0x3A: return "resting_heart_rate";
+    case 0x3D: return "max_heart_rate";
+    case 0x49: return "hrv";
+    default:   return "unknown";
+  }
+}
+
+void ZeppHelio::format_iso8601_utc_(time_t ts, std::string &out) {
+  struct tm tmv;
+  gmtime_r(&ts, &tmv);
+  char buf[32];
+  // HA recorder.import_statistics stats.start must be a 5-min-aligned
+  // RFC3339 timestamp in UTC. "+00:00" tail is mandatory.
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:00+00:00",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min);
+  out.assign(buf);
+}
+
+void ZeppHelio::flush_buckets_for_type_(uint8_t huami_code, size_t type_idx) {
+  if (active_buckets_.empty() || stat_triggers_.empty()) {
+    active_buckets_.clear();
+    return;
+  }
+  const char *name = huami_type_short_name_(huami_code);
+  for (auto &kv : active_buckets_) {
+    const Bucket &b = kv.second;
+    PendingStat s;
+    s.type = name;
+    format_iso8601_utc_(b.start_ts, s.start_iso);
+    s.mean = (float) (b.sum / (double) b.count);
+    s.min_v = (float) b.min_v;
+    s.max_v = (float) b.max_v;
+    s.count = b.count;
+    s.type_idx = type_idx;
+    pending_stats_.push_back(std::move(s));
+  }
+  active_buckets_.clear();
+}
+
+// ---- Statistic pump -----------------------------------------------------
+
+void ZeppHelio::pump_pending_stats_() {
+  if (stat_triggers_.empty()) {
+    pending_stats_.clear();
+    pending_stats_cursor_ = 0;
+    return;
+  }
+  if (pending_stats_cursor_ >= pending_stats_.size()) {
+    if (!pending_stats_.empty()) {
+      // Queue just drained → commit every type_idx we touched to NVS.
+      // We keep a simple set via an on-stack array.
+      std::array<bool, 8> touched{};
+      for (auto &p : pending_stats_) {
+        if (p.type_idx < touched.size()) touched[p.type_idx] = true;
+      }
+      for (size_t i = 0; i < touched.size(); i++) {
+        if (touched[i]) {
+          last_import_ts_[i] = (uint32_t) last_seen_[i];
+          save_last_import_ts_(i);
+        }
+      }
+      pending_stats_.clear();
+      pending_stats_cursor_ = 0;
+    }
+    return;
+  }
+
+  // Throttle: fire at most one bucket per 100 ms across all triggers.
+  // Keeps HA's API queue from backing up during a 24 h first-run dump.
+  uint32_t now_ms = millis();
+  if (now_ms - last_pending_fire_ms_ < 100) return;
+  last_pending_fire_ms_ = now_ms;
+
+  PendingStat &s = pending_stats_[pending_stats_cursor_++];
+  for (auto *t : stat_triggers_) {
+    t->trigger(s.type, s.start_iso, s.mean, s.min_v, s.max_v, s.count);
+  }
 }
 
 }  // namespace zepp_helio

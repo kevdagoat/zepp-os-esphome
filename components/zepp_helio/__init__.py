@@ -13,10 +13,22 @@ ZeppHelio = zepp_helio_ns.class_(
     "ZeppHelio", cg.Component, ble_client.BLEClientNode
 )
 
+from esphome import automation
+
 CONF_AUTH_KEY = "auth_key"
 CONF_CONTROL_PATH = "control_path"
+CONF_MAX_LOOKBACK = "max_lookback"
+CONF_FIRST_RUN_LOOKBACK = "first_run_lookback"
+CONF_ON_STATISTIC_READY = "on_statistic_ready"
 
 CONTROL_PATH_OPTIONS = ("zeppos", "legacy")
+
+StatisticReadyTrigger = zepp_helio_ns.class_(
+    "StatisticReadyTrigger",
+    automation.Trigger.template(
+        cg.std_string, cg.std_string, cg.float_, cg.float_, cg.float_, cg.uint32
+    ),
+)
 
 def _validate_hex16(value):
     value = cv.string_strict(value).replace(":", "").replace(" ", "")
@@ -36,6 +48,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CONTROL_PATH, default="zeppos"): cv.one_of(
             *CONTROL_PATH_OPTIONS, lower=True
         ),
+        cv.Optional(CONF_MAX_LOOKBACK, default="24h"): cv.positive_time_period_seconds,
+        cv.Optional(CONF_FIRST_RUN_LOOKBACK, default="24h"): cv.positive_time_period_seconds,
+        cv.Optional(CONF_ON_STATISTIC_READY): automation.validate_automation(
+            {cv.GenerateID(automation.CONF_TRIGGER_ID): cv.declare_id(StatisticReadyTrigger)}
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA).extend(ble_client.BLE_CLIENT_SCHEMA)
 
@@ -53,3 +70,20 @@ async def to_code(config):
     cg.add(var.set_time(rtc))
 
     cg.add(var.set_use_zeppos_control(config[CONF_CONTROL_PATH] == "zeppos"))
+    cg.add(var.set_max_lookback(config[CONF_MAX_LOOKBACK].total_seconds))
+    cg.add(var.set_first_run_lookback(config[CONF_FIRST_RUN_LOOKBACK].total_seconds))
+
+    for conf in config.get(CONF_ON_STATISTIC_READY, []):
+        trigger = cg.new_Pvariable(conf[automation.CONF_TRIGGER_ID], var)
+        await automation.build_automation(
+            trigger,
+            [
+                (cg.std_string, "type"),
+                (cg.std_string, "start"),
+                (cg.float_, "mean_value"),
+                (cg.float_, "min_value"),
+                (cg.float_, "max_value"),
+                (cg.uint32, "count"),
+            ],
+            conf,
+        )
