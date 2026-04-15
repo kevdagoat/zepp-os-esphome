@@ -380,52 +380,39 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
       ESP_LOGI(TAG, "service discovery complete, resolving chars");
       notify_registered_count_ = 0;
 
-      // Enumerate primary services first so we can scan per-service
-      // ranges instead of 0x0001..0xFFFF (which asserts in esp-idf 5.x
-      // when end_handle exceeds the discovered DB).
-      uint16_t conn_id = param->search_cmpl.conn_id;
-      uint16_t svc_count = 0;
-      esp_ble_gattc_get_attr_count(gattc_if, conn_id,
-                                   ESP_GATT_DB_PRIMARY_SERVICE,
-                                   0, 0, ESP_GATT_ILLEGAL_HANDLE,
-                                   &svc_count);
-      ESP_LOGI(TAG, "discovered %u primary services", (unsigned) svc_count);
-      std::vector<esp_gattc_service_elem_t> services(svc_count);
-      if (svc_count > 0) {
-        uint16_t got = svc_count;
-        esp_ble_gattc_get_service(gattc_if, conn_id, nullptr,
-                                  services.data(), &got, 0);
-        svc_count = got;
-        for (uint16_t i = 0; i < svc_count; i++) {
-          const auto &s = services[i];
-          if (s.uuid.len == ESP_UUID_LEN_16) {
-            ESP_LOGI(TAG, "  svc[%u] 0x%04X  h=%u..%u",
-                     i, s.uuid.uuid.uuid16, s.start_handle, s.end_handle);
-          } else {
-            ESP_LOGI(TAG, "  svc[%u] (128-bit) h=%u..%u",
-                     i, s.start_handle, s.end_handle);
-          }
+      // Iterate ESPHome's own service cache rather than the raw esp-idf
+      // GATT DB — recent ESPHome builds don't call esp_ble_gattc_search_
+      // service, so esp_ble_gattc_get_service returns 0 entries.
+      auto chunked_write_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000016-0000-3512-2118-0009af100700");
+      auto chunked_read_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000017-0000-3512-2118-0009af100700");
+      auto act_ctrl_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000004-0000-3512-2118-0009af100700");
+      auto act_data_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000005-0000-3512-2118-0009af100700");
+
+      h_chunked_write_ = 0;
+      h_chunked_read_  = 0;
+      h_act_control_   = 0;
+      h_act_data_      = 0;
+
+      auto &svc_list = this->parent()->services_;
+      ESP_LOGI(TAG, "cached services: %u", (unsigned) svc_list.size());
+      for (auto *svc : svc_list) {
+        ESP_LOGI(TAG, "  svc %s  h=%u..%u",
+                 svc->uuid.to_string().c_str(),
+                 svc->start_handle, svc->end_handle);
+        for (auto *chr : svc->characteristics) {
+          ESP_LOGD(TAG, "    chr %s  h=%u props=0x%02X",
+                   chr->uuid.to_string().c_str(),
+                   chr->handle, chr->properties);
+          if (chr->uuid == chunked_write_uuid) h_chunked_write_ = chr->handle;
+          else if (chr->uuid == chunked_read_uuid) h_chunked_read_ = chr->handle;
+          else if (chr->uuid == act_ctrl_uuid)  h_act_control_   = chr->handle;
+          else if (chr->uuid == act_data_uuid)  h_act_data_      = chr->handle;
         }
       }
-
-      auto find_char = [&](const char *uuid_str) -> uint16_t {
-        auto bt_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(uuid_str).get_uuid();
-        for (uint16_t i = 0; i < svc_count; i++) {
-          esp_gattc_char_elem_t elem{};
-          uint16_t cnt = 1;
-          esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(
-              gattc_if, conn_id,
-              services[i].start_handle, services[i].end_handle,
-              bt_uuid, &elem, &cnt);
-          if (st == ESP_GATT_OK && cnt > 0) return elem.char_handle;
-        }
-        return 0;
-      };
-
-      h_chunked_write_ = find_char("00000016-0000-3512-2118-0009af100700");
-      h_chunked_read_  = find_char("00000017-0000-3512-2118-0009af100700");
-      h_act_control_   = find_char("00000004-0000-3512-2118-0009af100700");
-      h_act_data_      = find_char("00000005-0000-3512-2118-0009af100700");
 
       bool missing = (h_chunked_write_ == 0 || h_chunked_read_ == 0 ||
                       h_act_data_ == 0 ||
