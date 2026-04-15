@@ -318,6 +318,20 @@ void ZeppHelio::loop() {
   // is in progress or between cycles.
   pump_pending_stats_();
 
+  // Inactivity watchdog. Any BLE event or outbound write bumps
+  // last_activity_ms_; if we're non-IDLE and nothing's moved in 30 s,
+  // force a disconnect + reset so the next trigger can retry.
+  if (state_ != State::IDLE) {
+    uint32_t now_ms = millis();
+    if (last_activity_ms_ == 0) last_activity_ms_ = now_ms;
+    if (now_ms - last_activity_ms_ > INACTIVITY_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "watchdog: state=%d idle for %u ms, forcing reset",
+               (int) state_, (unsigned) (now_ms - last_activity_ms_));
+      last_activity_ms_ = 0;
+      finish_and_disconnect_(false);
+    }
+  }
+
   if (want_fetch_ && state_ == State::IDLE) {
     want_fetch_ = false;
     start_connect_();
@@ -347,6 +361,7 @@ void ZeppHelio::trigger_fetch() {
 void ZeppHelio::start_connect_() {
   ESP_LOGI(TAG, "connecting to BLE client");
   state_ = State::CONNECTING;
+  last_activity_ms_ = millis();
   this->parent()->set_enabled(true);
   this->parent()->connect();
 }
@@ -356,6 +371,7 @@ void ZeppHelio::start_connect_() {
 void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
                                     esp_gatt_if_t gattc_if,
                                     esp_ble_gattc_cb_param_t *param) {
+  last_activity_ms_ = millis();
   switch (event) {
     case ESP_GATTC_OPEN_EVT:
       if (param->open.status == ESP_GATT_OK) {

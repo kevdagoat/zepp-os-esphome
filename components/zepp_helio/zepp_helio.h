@@ -335,6 +335,12 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   uint32_t last_pending_fire_ms_{0};
 
   bool want_fetch_{false};
+
+  // Activity watchdog. Every BLE event or outbound write bumps
+  // last_activity_ms_; if nothing has happened for this long while we
+  // aren't IDLE, force a disconnect + reset.
+  uint32_t last_activity_ms_{0};
+  static constexpr uint32_t INACTIVITY_TIMEOUT_MS = 30000;
 };
 
 }  // namespace zepp_helio
