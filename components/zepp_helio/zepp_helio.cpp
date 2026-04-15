@@ -380,17 +380,45 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
       ESP_LOGI(TAG, "service discovery complete, resolving chars");
       notify_registered_count_ = 0;
 
-      // Scan the entire handle range for each char UUID (matches bleak's
-      // global-by-UUID behaviour in test.py). Zepp OS devices parent the
-      // chunked chars under a custom service, not the legacy 0xFEE1.
+      // Enumerate primary services first so we can scan per-service
+      // ranges instead of 0x0001..0xFFFF (which asserts in esp-idf 5.x
+      // when end_handle exceeds the discovered DB).
       uint16_t conn_id = param->search_cmpl.conn_id;
+      uint16_t svc_count = 0;
+      esp_ble_gattc_get_attr_count(gattc_if, conn_id,
+                                   ESP_GATT_DB_PRIMARY_SERVICE,
+                                   0, 0, ESP_GATT_ILLEGAL_HANDLE,
+                                   &svc_count);
+      ESP_LOGI(TAG, "discovered %u primary services", (unsigned) svc_count);
+      std::vector<esp_gattc_service_elem_t> services(svc_count);
+      if (svc_count > 0) {
+        uint16_t got = svc_count;
+        esp_ble_gattc_get_service(gattc_if, conn_id, nullptr,
+                                  services.data(), &got, 0);
+        svc_count = got;
+        for (uint16_t i = 0; i < svc_count; i++) {
+          const auto &s = services[i];
+          if (s.uuid.len == ESP_UUID_LEN_16) {
+            ESP_LOGI(TAG, "  svc[%u] 0x%04X  h=%u..%u",
+                     i, s.uuid.uuid.uuid16, s.start_handle, s.end_handle);
+          } else {
+            ESP_LOGI(TAG, "  svc[%u] (128-bit) h=%u..%u",
+                     i, s.start_handle, s.end_handle);
+          }
+        }
+      }
+
       auto find_char = [&](const char *uuid_str) -> uint16_t {
         auto bt_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(uuid_str).get_uuid();
-        esp_gattc_char_elem_t elem{};
-        uint16_t cnt = 1;
-        esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(
-            gattc_if, conn_id, 0x0001, 0xFFFF, bt_uuid, &elem, &cnt);
-        if (st == ESP_GATT_OK && cnt > 0) return elem.char_handle;
+        for (uint16_t i = 0; i < svc_count; i++) {
+          esp_gattc_char_elem_t elem{};
+          uint16_t cnt = 1;
+          esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(
+              gattc_if, conn_id,
+              services[i].start_handle, services[i].end_handle,
+              bt_uuid, &elem, &cnt);
+          if (st == ESP_GATT_OK && cnt > 0) return elem.char_handle;
+        }
         return 0;
       };
 
