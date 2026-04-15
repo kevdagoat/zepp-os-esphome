@@ -8,6 +8,16 @@ sensors via the ESPHome native API.
 Port of `amazfit/zepp_proto.py` + `amazfit/zepp_temp_legacy.py` +
 `amazfit/huami_ecdh.py` to an ESPHome external component.
 
+Upstream: [`kevdagoat/zepp-os-esphome`](https://github.com/kevdagoat/zepp-os-esphome)
+
+Pull the component straight from GitHub in your YAML (no need to clone):
+
+```yaml
+external_components:
+  - source: github://kevdagoat/zepp-os-esphome@main
+    components: [ zepp_helio ]
+```
+
 Ported by Claude Code 
 
 ## Status

@@ -83,11 +83,8 @@ enum class State : uint8_t {
   CONNECTING,
   AUTH_PUBKEY_SENT,
   AUTH_SESSION_SENT,
-  FETCH_START,
   FETCH_WAIT_START_REPLY,
   FETCH_WAIT_DATA,
-  DONE,
-  FAILED,
 };
 
 class ZeppHelio : public Component, public ble_client::BLEClientNode {
@@ -186,7 +183,6 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   void send_fetch_data_();
   void send_ack_();
   void write_activity_control_(const uint8_t *cmd, size_t len);
-  void parse_round_samples_();
   void start_next_type_();
   void parse_buffer_for_type_(uint8_t type, const std::vector<uint8_t> &buf,
                               time_t round_start);

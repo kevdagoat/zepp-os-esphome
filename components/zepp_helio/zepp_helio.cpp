@@ -393,6 +393,12 @@ void ZeppHelio::handle_chunked_read_(const uint8_t *data, uint16_t len) {
   }
 
   if (first) {
+    if (len < 11) {
+      ESP_LOGW(TAG, "chunked first frame too short: len=%u", (unsigned) len);
+      chunked_buf_.clear();
+      chunked_handle_ = 0;
+      return;
+    }
     uint32_t full_len;
     std::memcpy(&full_len, &data[i], 4); i += 4;
     chunked_len_ = full_len;
@@ -402,12 +408,26 @@ void ZeppHelio::handle_chunked_read_(const uint8_t *data, uint16_t len) {
     chunked_encrypted_ = encrypted;
   }
 
+  if (i > len) {
+    ESP_LOGW(TAG, "chunked header past end of frame");
+    chunked_buf_.clear();
+    chunked_handle_ = 0;
+    return;
+  }
   chunked_buf_.insert(chunked_buf_.end(), &data[i], &data[len]);
   if (!last) return;
 
   std::vector<uint8_t> payload;
   if (chunked_encrypted_) {
     if (!have_session_) { chunked_buf_.clear(); chunked_handle_ = 0; return; }
+    if (chunked_buf_.size() % 16 != 0 ||
+        chunked_len_ > chunked_buf_.size()) {
+      ESP_LOGW(TAG, "chunked enc frame malformed: buf=%u len=%u",
+               (unsigned) chunked_buf_.size(), (unsigned) chunked_len_);
+      chunked_buf_.clear();
+      chunked_handle_ = 0;
+      return;
+    }
     uint8_t msg_key[16];
     derive_message_key(session_key_, chunked_handle_, msg_key);
     std::vector<uint8_t> pt(chunked_buf_.size());
@@ -415,6 +435,13 @@ void ZeppHelio::handle_chunked_read_(const uint8_t *data, uint16_t len) {
                           chunked_buf_.size() / 16, pt.data());
     payload.assign(pt.begin(), pt.begin() + chunked_len_);
   } else {
+    if (chunked_len_ > chunked_buf_.size()) {
+      ESP_LOGW(TAG, "chunked plain frame short: buf=%u len=%u",
+               (unsigned) chunked_buf_.size(), (unsigned) chunked_len_);
+      chunked_buf_.clear();
+      chunked_handle_ = 0;
+      return;
+    }
     payload.assign(chunked_buf_.begin(),
                    chunked_buf_.begin() + chunked_len_);
   }
@@ -450,6 +477,11 @@ void ZeppHelio::handle_auth_reply_(const uint8_t *p, int len) {
   if (p[1] == 0x04) {
     // pub key reply: [0x10 0x04 0x01 rand(16) remote_pub(48)]
     if (p[2] != 0x01) { finish_and_disconnect_(false); return; }
+    if (len < 67) {
+      ESP_LOGE(TAG, "auth pub reply short: len=%d", len);
+      finish_and_disconnect_(false);
+      return;
+    }
     std::memcpy(remote_random_, &p[3], 16);
     uint8_t remote_pub[48];
     std::memcpy(remote_pub, &p[19], 48);
@@ -520,7 +552,6 @@ void ZeppHelio::send_session_key_() {
 // ---- Legacy temperature fetch --------------------------------------------
 
 void ZeppHelio::begin_legacy_fetch_() {
-  state_ = State::FETCH_START;
   // Do NOT clear latest_ — stale cached values from prior cycles stay
   // published; only fields we actually see new data for this cycle get
   // overwritten. This is what keeps HR/temp/etc. sticky when the
@@ -574,8 +605,12 @@ static void pack_time_bytes(time_t ts, uint8_t out[8]) {
   out[4] = tmv.tm_hour;
   out[5] = tmv.tm_min;
   out[6] = 0;
-  // tz units of 15 min
-  out[7] = (uint8_t) (tmv.tm_gmtoff / 60 / 15);
+  // tz units of 15 min. newlib lacks tm_gmtoff; derive from ts - mktime(gmtime(ts)).
+  struct tm gmv;
+  gmtime_r(&ts, &gmv);
+  gmv.tm_isdst = tmv.tm_isdst;
+  long offset_sec = (long) (ts - mktime(&gmv));
+  out[7] = (int8_t) (offset_sec / 60 / 15);
 }
 
 void ZeppHelio::send_start_date_() {
@@ -599,7 +634,7 @@ void ZeppHelio::send_fetch_data_() {
 }
 
 void ZeppHelio::send_ack_() {
-  uint8_t cmd[2] = {0x03, 0x09};
+  uint8_t cmd[2] = {0x03, current_type_};
   write_activity_control_(cmd, 2);
 }
 
@@ -623,6 +658,11 @@ void ZeppHelio::on_control_notify_(const uint8_t *d, uint16_t len) {
   if (d[0] == 0x10 && d[1] == 0x01) {
     // START_DATE reply
     if (d[2] != 0x01) { finish_and_disconnect_(false); return; }
+    if (len < 7) {
+      ESP_LOGE(TAG, "start_date reply short: len=%u", (unsigned) len);
+      finish_and_disconnect_(false);
+      return;
+    }
     uint32_t exp;
     std::memcpy(&exp, &d[3], 4);
     expected_pkts_ = exp;
@@ -631,6 +671,12 @@ void ZeppHelio::on_control_notify_(const uint8_t *d, uint16_t len) {
       send_ack_();
       current_type_idx_++;
       start_next_type_();
+      return;
+    }
+    if (len < 13) {
+      ESP_LOGE(TAG, "start_date reply missing date fields: len=%u",
+               (unsigned) len);
+      finish_and_disconnect_(false);
       return;
     }
     // Reparse actual_start for round timestamp
@@ -643,6 +689,7 @@ void ZeppHelio::on_control_notify_(const uint8_t *d, uint16_t len) {
     tmv.tm_hour = d[11];
     tmv.tm_min = d[12];
     tmv.tm_sec = len > 13 ? d[13] : 0;
+    tmv.tm_isdst = -1;
     fetch_round_start_ = mktime(&tmv);
     send_fetch_data_();
   } else if (d[0] == 0x10 && d[1] == 0x02) {
@@ -667,8 +714,6 @@ void ZeppHelio::on_data_notify_(const uint8_t *d, uint16_t len) {
   last_data_counter_ = counter;
   round_buf_.insert(round_buf_.end(), d + 1, d + len);
 }
-
-void ZeppHelio::parse_round_samples_() {}  // unused, retained for ABI
 
 static int16_t rd_i16(const uint8_t *p) { int16_t v; std::memcpy(&v, p, 2); return v; }
 static uint32_t rd_u32(const uint8_t *p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -764,8 +809,7 @@ void ZeppHelio::parse_buffer_for_type_(uint8_t type,
       for (size_t i = 1; i + 65 <= n; i += 65) {
         time_t ts = (time_t) rd_u32(&b[i]);
         track_ts(ts);
-        int8_t raw = (int8_t) b[i + 4];
-        int v = raw < 0 ? raw + 128 : raw;
+        int v = (int) b[i + 4];
         latest_.spo2 = v;
         latest_.has_spo2 = true;
         bucket(ts, (double) v);
