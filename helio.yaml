@@ -1,0 +1,102 @@
+esphome:
+  name: helio-bridge
+  friendly_name: Helio Strap Bridge
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+
+ble_client:
+  - mac_address: <your device mac address here>
+    id: helio
+    auto_connect: false
+
+zepp_helio:
+  id: zepp
+  ble_client_id: helio
+  auth_key: "<your auth key here>"
+  time_id: sntp_time
+  # Activity-fetch control transport:
+  #   legacy  — unencrypted writes to char 0x0004 (Mi Band 4 backdoor).
+  #             All 8 fetch types verified working on Helio Strap via
+  #             amazfit/zepp_all_legacy.py. Simpler, skips encryption
+  #             on the hot path. Recommended for Helio.
+  #   zeppos  — chunked-2021 endpoint 0x004B, encrypted (matches
+  #             Gadgetbridge's ZeppOsActivityFetchService). Use this if
+  #             future firmware drops the legacy backdoor.
+  control_path: legacy
+
+sensor:
+  - platform: zepp_helio
+    zepp_helio_id: zepp
+    temperature:
+      name: "Helio Skin Temperature"
+    heart_rate:
+      name: "Helio Heart Rate"
+    resting_heart_rate:
+      name: "Helio Resting HR"
+    max_heart_rate:
+      name: "Helio Max HR"
+    steps:
+      name: "Helio Steps (last min)"
+    stress:
+      name: "Helio Stress"
+    spo2:
+      name: "Helio SpO2"
+    respiratory_rate:
+      name: "Helio Respiratory Rate"
+    hrv:
+      name: "Helio HRV"
+    sample_count:
+      name: "Helio Last Fetch Sample Count"
+
+binary_sensor:
+  - platform: zepp_helio
+    zepp_helio_id: zepp
+    worn:
+      name: "Helio Worn"
+
+text_sensor:
+  - platform: zepp_helio
+    zepp_helio_id: zepp
+    sleep_stage:
+      name: "Helio Sleep Stage"
+    activity_kind:
+      name: "Helio Activity Kind"
+
+interval:
+  - interval: 15min
+    then:
+      - lambda: |-
+          id(zepp).trigger_fetch();

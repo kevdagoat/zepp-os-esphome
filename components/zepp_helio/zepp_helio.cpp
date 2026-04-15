@@ -1,0 +1,739 @@
+// Zepp OS 2021+ auth + legacy temperature fetch for ESPHome.
+// Port of amazfit/zepp_proto.py + zepp_temp_legacy.py.
+//
+// WARNING: this is a scaffold. Service/characteristic handle discovery
+// uses short 16-bit UUIDs but Huami chars are 128-bit — you must match
+// by the full UUID string in the gattc SEARCH_CMPL handler. On first
+// boot, watch the logs to see which handles correspond to which chars
+// and adjust the UUID matching below if needed.
+
+#include "zepp_helio.h"
+#include "ecdh_b163.h"
+#include "esphome/core/log.h"
+#include "esphome/core/application.h"
+#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+
+#include <esp_bt_main.h>
+#include <esp_gap_ble_api.h>
+#include <esp_gatt_common_api.h>
+#include <mbedtls/aes.h>
+#include <cstring>
+#include <ctime>
+
+namespace esphome {
+namespace zepp_helio {
+
+static const char *const TAG = "zepp_helio";
+
+// Full Huami UUIDs (byte order as printed; reversed to little-endian 128)
+// 0000XXXX-0000-3512-2118-0009af100700
+static const uint8_t HUAMI_BASE_SUFFIX[] = {
+    0x00, 0x07, 0x10, 0xAF, 0x09, 0x00, 0x18, 0x21,
+    0x12, 0x35, 0x00, 0x00,
+};
+
+static bool is_huami_uuid(const esp_bt_uuid_t &uuid, uint16_t short_id) {
+  if (uuid.len != ESP_UUID_LEN_128) return false;
+  const uint8_t *u = uuid.uuid.uuid128;
+  if (std::memcmp(u, HUAMI_BASE_SUFFIX, 12) != 0) return false;
+  uint16_t sid = (uint16_t) u[12] | ((uint16_t) u[13] << 8);
+  return sid == short_id;
+}
+
+// ---- AES-ECB helpers -----------------------------------------------------
+
+static void aes_ecb_encrypt_block(const uint8_t key[16],
+                                  const uint8_t *in, size_t nblocks,
+                                  uint8_t *out) {
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  mbedtls_aes_setkey_enc(&ctx, key, 128);
+  for (size_t i = 0; i < nblocks; i++)
+    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, in + i * 16, out + i * 16);
+  mbedtls_aes_free(&ctx);
+}
+
+static void aes_ecb_decrypt_block(const uint8_t key[16],
+                                  const uint8_t *in, size_t nblocks,
+                                  uint8_t *out) {
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  mbedtls_aes_setkey_dec(&ctx, key, 128);
+  for (size_t i = 0; i < nblocks; i++)
+    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, in + i * 16, out + i * 16);
+  mbedtls_aes_free(&ctx);
+}
+
+static void derive_message_key(const uint8_t session_key[16],
+                               uint8_t handle, uint8_t out[16]) {
+  for (int i = 0; i < 16; i++) out[i] = session_key[i] ^ handle;
+}
+
+// CRC32 IEEE (matches Python zlib.crc32)
+static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int k = 0; k < 8; k++) {
+      uint32_t mask = -(int32_t)(crc & 1);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+// ---- Setup / config ------------------------------------------------------
+
+void ZeppHelio::setup() {
+  ESP_LOGI(TAG, "zepp_helio setup");
+  // Request MTU 247 at link layer so chunked writes get fat chunks.
+  esp_err_t st = esp_ble_gatt_set_local_mtu(247);
+  if (st != ESP_OK) {
+    ESP_LOGW(TAG, "esp_ble_gatt_set_local_mtu failed: %d", st);
+  }
+  // ECDH self-test (gap #2).
+  ecdh_ok_ = run_ecdh_self_test();
+  if (!ecdh_ok_) {
+    ESP_LOGE(TAG, "ECDH self-test FAILED — fetches will be disabled");
+  } else {
+    ESP_LOGI(TAG, "ECDH self-test OK");
+  }
+}
+
+bool ZeppHelio::run_ecdh_self_test() {
+  uint8_t priv_a[24], pub_a[48];
+  uint8_t priv_b[24], pub_b[48];
+  uint8_t shared_ab[48], shared_ba[48];
+  if (!ecdh_generate_keypair(priv_a, pub_a)) return false;
+  if (!ecdh_generate_keypair(priv_b, pub_b)) return false;
+  if (!ecdh_generate_shared(priv_a, pub_b, shared_ab)) return false;
+  if (!ecdh_generate_shared(priv_b, pub_a, shared_ba)) return false;
+  return std::memcmp(shared_ab, shared_ba, 48) == 0;
+}
+
+void ZeppHelio::dump_config() {
+  ESP_LOGCONFIG(TAG, "Zepp Helio client");
+  ESP_LOGCONFIG(TAG, "  Auth key set: %d", auth_key_[0] != 0);
+}
+
+void ZeppHelio::loop() {
+  // Periodic state pump placeholder; real flow is event-driven in gattc cb.
+  if (want_fetch_ && state_ == State::IDLE) {
+    want_fetch_ = false;
+    start_connect_();
+  }
+}
+
+void ZeppHelio::trigger_fetch() {
+  if (state_ != State::IDLE) {
+    ESP_LOGW(TAG, "fetch requested but state=%d", (int) state_);
+    return;
+  }
+  if (!ecdh_ok_) {
+    ESP_LOGW(TAG, "fetch skipped: ECDH self-test failed at boot");
+    return;
+  }
+  // Gap #3: don't run a fetch before SNTP has synced — fetch_since_
+  // would be garbage and the device would either reject or return
+  // unbounded history.
+  if (time_ == nullptr || !time_->now().is_valid()) {
+    ESP_LOGW(TAG, "fetch skipped: clock not yet synced");
+    return;
+  }
+  ESP_LOGI(TAG, "fetch triggered");
+  want_fetch_ = true;
+}
+
+void ZeppHelio::start_connect_() {
+  ESP_LOGI(TAG, "connecting to BLE client");
+  state_ = State::CONNECTING;
+  this->parent()->set_enabled(true);
+  this->parent()->connect();
+}
+
+// ---- GATT event handler --------------------------------------------------
+
+void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
+                                    esp_gatt_if_t gattc_if,
+                                    esp_ble_gattc_cb_param_t *param) {
+  switch (event) {
+    case ESP_GATTC_OPEN_EVT:
+      if (param->open.status == ESP_GATT_OK) {
+        ESP_LOGI(TAG, "BLE open ok");
+        // Request a bigger MTU post-connect. Device will reply with
+        // ESP_GATTC_CFG_MTU_EVT carrying the negotiated value.
+        esp_ble_gattc_send_mtu_req(gattc_if, param->open.conn_id);
+      }
+      break;
+
+    case ESP_GATTC_CFG_MTU_EVT:
+      if (param->cfg_mtu.status == ESP_GATT_OK) {
+        mtu_ = param->cfg_mtu.mtu > 23 ? param->cfg_mtu.mtu : 23;
+        ESP_LOGI(TAG, "MTU negotiated: %u", (unsigned) mtu_);
+      } else {
+        ESP_LOGW(TAG, "MTU negotiation failed, using 23");
+        mtu_ = 23;
+      }
+      break;
+
+    case ESP_GATTC_SEARCH_CMPL_EVT: {
+      ESP_LOGI(TAG, "service discovery complete, resolving chars");
+      notify_registered_count_ = 0;
+
+      // Huami service: standard 16-bit FEE1
+      auto svc = esp32_ble_tracker::ESPBTUUID::from_uint16(0xFEE1);
+      auto chunked_write = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000016-0000-3512-2118-0009af100700");
+      auto chunked_read = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000017-0000-3512-2118-0009af100700");
+      auto act_ctrl = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000004-0000-3512-2118-0009af100700");
+      auto act_data = esp32_ble_tracker::ESPBTUUID::from_raw(
+          "00000005-0000-3512-2118-0009af100700");
+
+      auto *cw = this->parent()->get_characteristic(svc, chunked_write);
+      auto *cr = this->parent()->get_characteristic(svc, chunked_read);
+      auto *ac = this->parent()->get_characteristic(svc, act_ctrl);
+      auto *ad = this->parent()->get_characteristic(svc, act_data);
+      if (cw == nullptr || cr == nullptr || ad == nullptr ||
+          (!use_zeppos_control_ && ac == nullptr)) {
+        ESP_LOGE(TAG, "missing char: cw=%p cr=%p ac=%p ad=%p",
+                 (void*)cw, (void*)cr, (void*)ac, (void*)ad);
+        finish_and_disconnect_(false);
+        return;
+      }
+      h_chunked_write_ = cw->handle;
+      h_chunked_read_  = cr->handle;
+      h_act_data_      = ad->handle;
+      h_act_control_   = (ac != nullptr) ? ac->handle : 0;
+      ESP_LOGI(TAG, "handles cw=0x%04X cr=0x%04X ac=0x%04X ad=0x%04X "
+                    "(control_path=%s)",
+               h_chunked_write_, h_chunked_read_, h_act_control_, h_act_data_,
+               use_zeppos_control_ ? "zeppos" : "legacy");
+
+      // Notify subs depend on control_path:
+      //   zeppos: chunked_read + act_data           (target=2)
+      //   legacy: chunked_read + act_data + act_ctl (target=3)
+      auto remote = this->parent()->get_remote_bda();
+      esp_ble_gattc_register_for_notify(gattc_if, remote, h_chunked_read_);
+      esp_ble_gattc_register_for_notify(gattc_if, remote, h_act_data_);
+      if (!use_zeppos_control_) {
+        esp_ble_gattc_register_for_notify(gattc_if, remote, h_act_control_);
+        notify_target_count_ = 3;
+      } else {
+        notify_target_count_ = 2;
+      }
+      break;
+    }
+
+    case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
+      if (param->reg_for_notify.status != ESP_GATT_OK) {
+        ESP_LOGE(TAG, "register_for_notify failed on handle 0x%04X: %d",
+                 param->reg_for_notify.handle,
+                 param->reg_for_notify.status);
+        finish_and_disconnect_(false);
+        break;
+      }
+      notify_registered_count_++;
+      ESP_LOGD(TAG, "notify registered %u/%u (handle 0x%04X)",
+               notify_registered_count_, notify_target_count_,
+               param->reg_for_notify.handle);
+      if (notify_registered_count_ >= notify_target_count_) {
+        on_connected_();
+      }
+      break;
+    }
+
+    case ESP_GATTC_NOTIFY_EVT: {
+      uint16_t h = param->notify.handle;
+      const uint8_t *v = param->notify.value;
+      uint16_t len = param->notify.value_len;
+      if (h == h_chunked_read_) {
+        handle_chunked_read_(v, len);
+      } else if (h == h_act_data_) {
+        on_data_notify_(v, len);
+      } else if (h == h_act_control_ && !use_zeppos_control_) {
+        // Legacy path: control replies come directly on char 0x04.
+        on_control_notify_(v, len);
+      }
+      break;
+    }
+
+    case ESP_GATTC_DISCONNECT_EVT:
+      ESP_LOGI(TAG, "BLE disconnected");
+      state_ = State::IDLE;
+      have_session_ = false;
+      notify_registered_count_ = 0;
+      chunked_buf_.clear();
+      chunked_handle_ = 0;
+      break;
+
+    default:
+      break;
+  }
+}
+
+void ZeppHelio::on_connected_() {
+  ESP_LOGI(TAG, "starting auth handshake");
+  if (!ecdh_generate_keypair(priv_key_, pub_key_)) {
+    ESP_LOGE(TAG, "ECDH keygen failed");
+    finish_and_disconnect_(false);
+    return;
+  }
+  state_ = State::AUTH_PUBKEY_SENT;
+  send_pubkey_();
+}
+
+// ---- Chunked framing -----------------------------------------------------
+
+void ZeppHelio::encode_and_write_(uint16_t endpoint, const uint8_t *data,
+                                  size_t len, bool encrypt) {
+  uint8_t handle = ++write_handle_counter_;
+  std::vector<uint8_t> payload;
+  size_t length;
+
+  if (encrypt) {
+    if (!have_session_) {
+      ESP_LOGE(TAG, "encrypt without session key");
+      return;
+    }
+    length = len;
+    size_t enc_len = length + 8;
+    size_t overflow = enc_len % 16;
+    if (overflow) enc_len += 16 - overflow;
+
+    std::vector<uint8_t> pt(enc_len, 0);
+    std::memcpy(pt.data(), data, length);
+    uint32_t seq = encrypted_seq_++;
+    std::memcpy(pt.data() + length, &seq, 4);
+    uint32_t crc = crc32_ieee(pt.data(), length + 4);
+    std::memcpy(pt.data() + length + 4, &crc, 4);
+
+    uint8_t msg_key[16];
+    derive_message_key(session_key_, handle, msg_key);
+    payload.resize(enc_len);
+    aes_ecb_encrypt_block(msg_key, pt.data(), enc_len / 16, payload.data());
+  } else {
+    length = len;
+    payload.assign(data, data + len);
+  }
+
+  const int HEADER_FIRST = 11;
+  const int HEADER_CONT = 5;
+
+  size_t remaining = payload.size();
+  size_t offset = 0;
+  uint8_t count = 0;
+  while (remaining > 0) {
+    bool first = (count == 0);
+    int hdr = first ? HEADER_FIRST : HEADER_CONT;
+    int max_chunk = (mtu_ - 3) - hdr;
+    if (max_chunk <= 0) max_chunk = 1;
+    size_t take = remaining < (size_t) max_chunk ? remaining : (size_t) max_chunk;
+
+    uint8_t flags = 0;
+    if (first) flags |= 0x01;
+    if (remaining <= (size_t) max_chunk) { flags |= 0x02; flags |= 0x04; }
+    if (encrypt) flags |= 0x08;
+
+    std::vector<uint8_t> buf(hdr + take);
+    buf[0] = 0x03;
+    buf[1] = flags;
+    buf[2] = 0x00;
+    buf[3] = handle;
+    buf[4] = count;
+    if (first) {
+      uint32_t l32 = (uint32_t) length;
+      std::memcpy(&buf[5], &l32, 4);
+      uint16_t ep = endpoint;
+      std::memcpy(&buf[9], &ep, 2);
+    }
+    std::memcpy(&buf[hdr], &payload[offset], take);
+
+    // Write without response
+    esp_ble_gattc_write_char(this->parent()->get_gattc_if(),
+                             this->parent()->get_conn_id(),
+                             h_chunked_write_,
+                             buf.size(), buf.data(),
+                             ESP_GATT_WRITE_TYPE_NO_RSP,
+                             ESP_GATT_AUTH_REQ_NONE);
+
+    offset += take;
+    remaining -= take;
+    count++;
+  }
+}
+
+void ZeppHelio::handle_chunked_read_(const uint8_t *data, uint16_t len) {
+  if (len < 5 || data[0] != 0x03) return;
+  int i = 1;
+  uint8_t flags = data[i++];
+  bool encrypted = flags & 0x08;
+  bool first = flags & 0x01;
+  bool last = flags & 0x02;
+  i++;  // ext flags zero
+  uint8_t handle = data[i++];
+  uint8_t count = data[i++];
+  (void) count;
+
+  if (chunked_handle_ != 0 && chunked_handle_ != handle) {
+    chunked_buf_.clear();
+  }
+
+  if (first) {
+    uint32_t full_len;
+    std::memcpy(&full_len, &data[i], 4); i += 4;
+    chunked_len_ = full_len;
+    std::memcpy(&chunked_type_, &data[i], 2); i += 2;
+    chunked_buf_.clear();
+    chunked_handle_ = handle;
+    chunked_encrypted_ = encrypted;
+  }
+
+  chunked_buf_.insert(chunked_buf_.end(), &data[i], &data[len]);
+  if (!last) return;
+
+  std::vector<uint8_t> payload;
+  if (chunked_encrypted_) {
+    if (!have_session_) { chunked_buf_.clear(); chunked_handle_ = 0; return; }
+    uint8_t msg_key[16];
+    derive_message_key(session_key_, chunked_handle_, msg_key);
+    std::vector<uint8_t> pt(chunked_buf_.size());
+    aes_ecb_decrypt_block(msg_key, chunked_buf_.data(),
+                          chunked_buf_.size() / 16, pt.data());
+    payload.assign(pt.begin(), pt.begin() + chunked_len_);
+  } else {
+    payload.assign(chunked_buf_.begin(),
+                   chunked_buf_.begin() + chunked_len_);
+  }
+  chunked_buf_.clear();
+  chunked_handle_ = 0;
+
+  // AUTH endpoint = 0x0082
+  if (chunked_type_ == 0x0082) {
+    handle_auth_reply_(payload.data(), payload.size());
+  } else if (chunked_type_ == 0x004B) {
+    // Zepp OS activity fetch control replies
+    on_control_notify_(payload.data(), payload.size());
+  }
+}
+
+// ---- Auth ----------------------------------------------------------------
+
+void ZeppHelio::send_pubkey_() {
+  uint8_t cmd[1 + 3 + 48];
+  cmd[0] = 0x04;  // CMD_PUB_KEY
+  cmd[1] = 0x02;
+  cmd[2] = 0x00;
+  cmd[3] = 0x02;
+  std::memcpy(&cmd[4], pub_key_, 48);
+  encode_and_write_(0x0082, cmd, sizeof(cmd), false);
+}
+
+void ZeppHelio::handle_auth_reply_(const uint8_t *p, int len) {
+  if (len < 3 || p[0] != 0x10) return;
+  if (p[1] == 0x04) {
+    // pub key reply: [0x10 0x04 0x01 rand(16) remote_pub(48)]
+    if (p[2] != 0x01) { finish_and_disconnect_(false); return; }
+    std::memcpy(remote_random_, &p[3], 16);
+    uint8_t remote_pub[48];
+    std::memcpy(remote_pub, &p[19], 48);
+    uint8_t shared[48];
+    if (!ecdh_generate_shared(priv_key_, remote_pub, shared)) {
+      finish_and_disconnect_(false); return;
+    }
+    std::memcpy(&encrypted_seq_, shared, 4);
+    for (int i = 0; i < 16; i++)
+      session_key_[i] = shared[i + 8] ^ auth_key_[i];
+    have_session_ = true;
+    send_session_key_();
+  } else if (p[1] == 0x05) {
+    if (p[2] == 0x25) { ESP_LOGE(TAG, "wrong auth key"); finish_and_disconnect_(false); return; }
+    if (p[2] != 0x01) { finish_and_disconnect_(false); return; }
+    ESP_LOGI(TAG, "auth success");
+    begin_legacy_fetch_();
+  }
+}
+
+void ZeppHelio::send_session_key_() {
+  uint8_t enc_r1[16], enc_r2[16];
+  aes_ecb_encrypt_block(auth_key_, remote_random_, 1, enc_r1);
+  aes_ecb_encrypt_block(session_key_, remote_random_, 1, enc_r2);
+  uint8_t cmd[1 + 32];
+  cmd[0] = 0x05;
+  std::memcpy(&cmd[1], enc_r1, 16);
+  std::memcpy(&cmd[17], enc_r2, 16);
+  encode_and_write_(0x0082, cmd, sizeof(cmd), false);
+  state_ = State::AUTH_SESSION_SENT;
+}
+
+// ---- Legacy temperature fetch --------------------------------------------
+
+void ZeppHelio::begin_legacy_fetch_() {
+  state_ = State::FETCH_START;
+  latest_ = LatestValues{};
+  current_type_idx_ = 0;
+  start_next_type_();
+}
+
+void ZeppHelio::start_next_type_() {
+  if (current_type_idx_ >= fetch_types_.size()) {
+    publish_latest_();
+    finish_and_disconnect_(true);
+    return;
+  }
+  current_type_ = fetch_types_[current_type_idx_];
+  time_t now = time_ ? time_->now().timestamp : ::time(nullptr);
+  fetch_since_ = now - 15 * 60;
+  round_num_ = 0;
+  ESP_LOGI(TAG, "fetching type 0x%02X", current_type_);
+  send_start_date_();
+}
+
+static void pack_time_bytes(time_t ts, uint8_t out[8]) {
+  struct tm tmv;
+  localtime_r(&ts, &tmv);
+  uint16_t year = tmv.tm_year + 1900;
+  out[0] = year & 0xFF;
+  out[1] = year >> 8;
+  out[2] = tmv.tm_mon + 1;
+  out[3] = tmv.tm_mday;
+  out[4] = tmv.tm_hour;
+  out[5] = tmv.tm_min;
+  out[6] = 0;
+  // tz units of 15 min
+  out[7] = (uint8_t) (tmv.tm_gmtoff / 60 / 15);
+}
+
+void ZeppHelio::send_start_date_() {
+  fetch_round_start_ = fetch_since_;
+  last_data_counter_ = -1;
+  round_buf_.clear();
+  round_num_++;
+
+  uint8_t cmd[10];
+  cmd[0] = 0x01;           // CMD_START_DATE
+  cmd[1] = current_type_;  // active fetch type
+  pack_time_bytes(fetch_since_, &cmd[2]);
+  write_activity_control_(cmd, sizeof(cmd));
+  state_ = State::FETCH_WAIT_START_REPLY;
+}
+
+void ZeppHelio::send_fetch_data_() {
+  uint8_t cmd[1] = {0x02};
+  write_activity_control_(cmd, 1);
+  state_ = State::FETCH_WAIT_DATA;
+}
+
+void ZeppHelio::send_ack_() {
+  uint8_t cmd[2] = {0x03, 0x09};
+  write_activity_control_(cmd, 2);
+}
+
+void ZeppHelio::write_activity_control_(const uint8_t *cmd, size_t len) {
+  if (use_zeppos_control_) {
+    // Zepp OS: encrypted chunked-2021 endpoint 0x004B
+    encode_and_write_(0x004B, cmd, len, true);
+  } else {
+    // Legacy: unencrypted raw write to char 0x0004
+    esp_ble_gattc_write_char(this->parent()->get_gattc_if(),
+                             this->parent()->get_conn_id(),
+                             h_act_control_, len,
+                             const_cast<uint8_t *>(cmd),
+                             ESP_GATT_WRITE_TYPE_NO_RSP,
+                             ESP_GATT_AUTH_REQ_NONE);
+  }
+}
+
+void ZeppHelio::on_control_notify_(const uint8_t *d, uint16_t len) {
+  if (len < 3) return;
+  if (d[0] == 0x10 && d[1] == 0x01) {
+    // START_DATE reply
+    if (d[2] != 0x01) { finish_and_disconnect_(false); return; }
+    uint32_t exp;
+    std::memcpy(&exp, &d[3], 4);
+    expected_pkts_ = exp;
+    if (exp == 0) {
+      ESP_LOGI(TAG, "type 0x%02X: no data for window", current_type_);
+      send_ack_();
+      current_type_idx_++;
+      start_next_type_();
+      return;
+    }
+    // Reparse actual_start for round timestamp
+    uint16_t year;
+    std::memcpy(&year, &d[7], 2);
+    struct tm tmv{};
+    tmv.tm_year = year - 1900;
+    tmv.tm_mon = d[9] - 1;
+    tmv.tm_mday = d[10];
+    tmv.tm_hour = d[11];
+    tmv.tm_min = d[12];
+    tmv.tm_sec = len > 13 ? d[13] : 0;
+    fetch_round_start_ = mktime(&tmv);
+    send_fetch_data_();
+  } else if (d[0] == 0x10 && d[1] == 0x02) {
+    // FETCH_DATA reply — round complete
+    if (d[2] != 0x01) { finish_and_disconnect_(false); return; }
+    parse_buffer_for_type_(current_type_, round_buf_, fetch_round_start_);
+    send_ack_();
+    // Single round covers the 15-min window for all types we use.
+    // Advance to next type.
+    current_type_idx_++;
+    start_next_type_();
+  }
+}
+
+void ZeppHelio::on_data_notify_(const uint8_t *d, uint16_t len) {
+  if (len == 0) return;
+  uint8_t counter = d[0];
+  if ((int) counter != ((last_data_counter_ + 1) & 0xFF)) {
+    ESP_LOGW(TAG, "data counter gap got=%d exp=%d",
+             counter, (last_data_counter_ + 1) & 0xFF);
+  }
+  last_data_counter_ = counter;
+  round_buf_.insert(round_buf_.end(), d + 1, d + len);
+}
+
+void ZeppHelio::parse_round_samples_() {}  // unused, retained for ABI
+
+static int16_t rd_i16(const uint8_t *p) { int16_t v; std::memcpy(&v, p, 2); return v; }
+
+void ZeppHelio::parse_buffer_for_type_(uint8_t type,
+                                       const std::vector<uint8_t> &buf,
+                                       time_t round_start) {
+  const uint8_t *b = buf.data();
+  size_t n = buf.size();
+  size_t count = 0;
+
+  switch (type) {
+    // Sentinel policy matches Gadgetbridge: only STRESS filters 0xFF.
+    // All other types persist raw per upstream FetchXxxOperation.java.
+    case 0x2E: {  // TEMPERATURE — 8 bytes: unk16(=32767 typ), temp16, unk32
+      for (size_t i = 0; i + 8 <= n; i += 8) {
+        int16_t raw = rd_i16(&b[i + 2]);
+        latest_.temp = raw / 100.0f;
+        latest_.has_temp = true;
+        count++;
+      }
+      break;
+    }
+    case 0x01: {  // ACTIVITY — 4B basic or 8B extended sample.
+      // Helio streams 8B records (FetchActivityOperation.createExtendedSample).
+      // Layout: kind, intensity, steps, hr, unk, sleep, deep_sleep, rem_sleep.
+      // We handle both; detection: length % 8 == 0 → extended.
+      const size_t rec = (n % 8 == 0) ? 8 : 4;
+      for (size_t i = 0; i + rec <= n; i += rec) {
+        uint8_t kind = b[i];
+        uint8_t hr   = b[i + 3];
+        uint8_t steps = b[i + 2];
+
+        latest_.kind = kind;
+        latest_.has_kind = true;
+        latest_.worn = huami_kind_is_worn(kind);
+        latest_.has_worn = true;
+
+        // HR is only trustworthy when the band is on wrist. Gate cache
+        // updates so an off-wrist 0xFF doesn't overwrite the last real HR.
+        if (latest_.worn && hr != 0 && hr != 0xFF) {
+          latest_.hr = hr;
+          latest_.has_hr = true;
+        }
+        if (latest_.worn) {
+          latest_.steps = steps;
+          latest_.has_steps = true;
+        }
+        count++;
+      }
+      break;
+    }
+    case 0x13: {  // STRESS_AUTO — 1B, 0xFF = skip per FetchStressAutoOperation
+      for (size_t i = 0; i < n; i++) {
+        if (b[i] == 0xFF) continue;
+        latest_.stress = b[i];
+        latest_.has_stress = true;
+        count++;
+      }
+      break;
+    }
+    case 0x25: {  // SPO2_NORMAL — 1B hdr (v=2) + 65B recs
+      if (n < 1 || b[0] != 2) { ESP_LOGW(TAG, "spo2 ver mismatch"); break; }
+      for (size_t i = 1; i + 65 <= n; i += 65) {
+        int8_t raw = (int8_t) b[i + 4];
+        int v = raw < 0 ? raw + 128 : raw;  // GB: spo2raw<0 == auto flag
+        latest_.spo2 = v;
+        latest_.has_spo2 = true;
+        count++;
+      }
+      break;
+    }
+    case 0x3A: {  // RESTING_HR — 6B: ts32, tz8, hr8
+      for (size_t i = 0; i + 6 <= n; i += 6) {
+        latest_.resting_hr = b[i + 5];
+        latest_.has_resting_hr = true;
+        count++;
+      }
+      break;
+    }
+    case 0x3D: {  // MAX_HR — 6B: ts32, tz8, hr8
+      for (size_t i = 0; i + 6 <= n; i += 6) {
+        latest_.max_hr = b[i + 5];
+        latest_.has_max_hr = true;
+        count++;
+      }
+      break;
+    }
+    case 0x38: {  // SLEEP_RESPIRATORY_RATE — 8B: ts32, tz8, rate8, unk, unk
+      for (size_t i = 0; i + 8 <= n; i += 8) {
+        latest_.resp = b[i + 5];
+        latest_.has_resp = true;
+        count++;
+      }
+      break;
+    }
+    case 0x49: {  // HRV — 6B: ts32, unk8, hrv8
+      for (size_t i = 0; i + 6 <= n; i += 6) {
+        latest_.hrv = b[i + 5];
+        latest_.has_hrv = true;
+        count++;
+      }
+      break;
+    }
+    default:
+      ESP_LOGW(TAG, "no parser for type 0x%02X (%u bytes)",
+               type, (unsigned) n);
+      break;
+  }
+  (void) round_start;
+  latest_.total_samples += count;
+  ESP_LOGI(TAG, "type 0x%02X: parsed %u samples", type, (unsigned) count);
+}
+
+void ZeppHelio::publish_latest_() {
+  if (temp_sensor_       && latest_.has_temp)       temp_sensor_->publish_state(latest_.temp);
+  if (hr_sensor_         && latest_.has_hr)         hr_sensor_->publish_state(latest_.hr);
+  if (resting_hr_sensor_ && latest_.has_resting_hr) resting_hr_sensor_->publish_state(latest_.resting_hr);
+  if (max_hr_sensor_     && latest_.has_max_hr)     max_hr_sensor_->publish_state(latest_.max_hr);
+  if (steps_sensor_      && latest_.has_steps)      steps_sensor_->publish_state(latest_.steps);
+  if (stress_sensor_     && latest_.has_stress)     stress_sensor_->publish_state(latest_.stress);
+  if (spo2_sensor_       && latest_.has_spo2)       spo2_sensor_->publish_state(latest_.spo2);
+  if (resp_rate_sensor_  && latest_.has_resp)       resp_rate_sensor_->publish_state(latest_.resp);
+  if (hrv_sensor_        && latest_.has_hrv)        hrv_sensor_->publish_state(latest_.hrv);
+  if (count_sensor_)                                count_sensor_->publish_state(latest_.total_samples);
+  if (worn_sensor_       && latest_.has_worn)       worn_sensor_->publish_state(latest_.worn);
+  if (sleep_stage_sensor_ && latest_.has_kind)
+    sleep_stage_sensor_->publish_state(huami_kind_to_sleep_stage(latest_.kind));
+  if (activity_kind_sensor_ && latest_.has_kind)
+    activity_kind_sensor_->publish_state(huami_kind_to_string(latest_.kind));
+}
+
+void ZeppHelio::finish_and_disconnect_(bool ok) {
+  ESP_LOGI(TAG, "fetch %s, total %u samples across types",
+           ok ? "ok" : "FAIL", (unsigned) latest_.total_samples);
+  state_ = State::IDLE;
+  have_session_ = false;
+  this->parent()->disconnect();
+}
+
+}  // namespace zepp_helio
+}  // namespace esphome
