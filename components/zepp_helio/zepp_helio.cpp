@@ -415,6 +415,9 @@ void ZeppHelio::handle_chunked_read_(const uint8_t *data, uint16_t len) {
   } else if (chunked_type_ == 0x004B) {
     // Zepp OS activity fetch control replies
     on_control_notify_(payload.data(), payload.size());
+  } else if (chunked_type_ == 0x0029) {
+    // Battery service reply
+    handle_battery_reply_(payload.data(), payload.size());
   }
 }
 
@@ -451,8 +454,43 @@ void ZeppHelio::handle_auth_reply_(const uint8_t *p, int len) {
     if (p[2] == 0x25) { ESP_LOGE(TAG, "wrong auth key"); finish_and_disconnect_(false); return; }
     if (p[2] != 0x01) { finish_and_disconnect_(false); return; }
     ESP_LOGI(TAG, "auth success");
+    // Fire-and-forget battery request on the chunked-2021 pipe; reply
+    // lands in handle_battery_reply_ whenever it arrives. Does not
+    // gate the legacy fetch state machine.
+    request_battery_();
     begin_legacy_fetch_();
   }
+}
+
+void ZeppHelio::request_battery_() {
+  // ZeppOsBatteryService: endpoint 0x0029, CMD_BATTERY_REQUEST = 0x03
+  uint8_t cmd[1] = {0x03};
+  encode_and_write_(0x0029, cmd, 1, true);
+}
+
+void ZeppHelio::handle_battery_reply_(const uint8_t *p, int len) {
+  // HuamiBatteryInfo layout:
+  //   p[0] = CMD_BATTERY_REPLY (0x04)
+  //   p[1] = unknown first field
+  //   p[2] = level percent
+  //   p[3] = state (0 normal, 1 charging)
+  //   p[4..10]  = current/last-known time
+  //   p[11..18] = last charge time (year LE, mon, day, h, m, s, ...)
+  //   p[20]     = last charge target percent
+  if (len < 4 || p[0] != 0x04) {
+    ESP_LOGW(TAG, "battery reply malformed (len=%d byte0=0x%02X)", len, len ? p[0] : 0);
+    return;
+  }
+  latest_.battery_pct = p[2];
+  latest_.has_battery = true;
+  latest_.charging = (p[3] == 1);
+  latest_.has_charging = true;
+  ESP_LOGI(TAG, "battery %d%% %s", latest_.battery_pct,
+           latest_.charging ? "charging" : "normal");
+  // Publish immediately — fetch cycle may still be running, but the
+  // battery reply is self-contained so no reason to wait.
+  if (battery_sensor_) battery_sensor_->publish_state(latest_.battery_pct);
+  if (charging_sensor_) charging_sensor_->publish_state(latest_.charging);
 }
 
 void ZeppHelio::send_session_key_() {
@@ -720,6 +758,8 @@ void ZeppHelio::publish_latest_() {
   if (resp_rate_sensor_  && latest_.has_resp)       resp_rate_sensor_->publish_state(latest_.resp);
   if (hrv_sensor_        && latest_.has_hrv)        hrv_sensor_->publish_state(latest_.hrv);
   if (count_sensor_)                                count_sensor_->publish_state(latest_.total_samples);
+  if (battery_sensor_    && latest_.has_battery)    battery_sensor_->publish_state(latest_.battery_pct);
+  if (charging_sensor_   && latest_.has_charging)   charging_sensor_->publish_state(latest_.charging);
   if (worn_sensor_       && latest_.has_worn)       worn_sensor_->publish_state(latest_.worn);
   if (sleep_stage_sensor_ && latest_.has_kind)
     sleep_stage_sensor_->publish_state(huami_kind_to_sleep_stage(latest_.kind));

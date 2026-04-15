@@ -8,6 +8,8 @@ sensors via the ESPHome native API.
 Port of `amazfit/zepp_proto.py` + `amazfit/zepp_temp_legacy.py` +
 `amazfit/huami_ecdh.py` to an ESPHome external component.
 
+Ported by Claude Code 
+
 ## Status
 
 **Scaffold.** Protocol logic is ported and cross-checked against
@@ -84,7 +86,13 @@ confirmed working on Helio via the legacy control path (see
 | `max_heart_rate`     |      0x3D  |        6 B  | `FetchHeartRateMaxOperation`                   |
 | `respiratory_rate`   |      0x38  |        8 B  | `FetchSleepRespiratoryRateOperation`           |
 | `hrv`                |      0x49  |        6 B  | `FetchHrvOperation`                            |
+| `battery_level`      |   0x0029 † |      21 B   | `ZeppOsBatteryService` / `HuamiBatteryInfo`    |
 | `sample_count`       |         —  |          —  | total samples parsed across all types          |
+
+† Battery is not a fetch-queue type — it's a one-shot request on the
+chunked-2021 encrypted pipe at endpoint `0x0029`. Fired right after
+auth success; the reply lands in `handle_battery_reply_()` and
+publishes immediately without waiting for the legacy activity fetch.
 
 HR and steps are **gated on wear state**: if the latest activity record
 has `kind` == `NOT_WORN` / `CHARGING` / `UNSET`, those cache slots are
@@ -93,13 +101,14 @@ overwritten with an off-wrist `0xFF`.
 
 ### Binary sensors (`binary_sensor:`)
 
-| Sensor | Source                              | True when                                        |
-|--------|-------------------------------------|--------------------------------------------------|
-| `worn` | activity `kind` byte (0x01 @ off 0) | `kind ∉ {115 NOT_WORN, 118 CHARGING, 0xFF UNSET}` |
+| Sensor     | Source                              | True when                                        |
+|------------|-------------------------------------|--------------------------------------------------|
+| `worn`     | activity `kind` byte (0x01 @ off 0) | `kind ∉ {115 NOT_WORN, 118 CHARGING, 0xFF UNSET}` |
+| `charging` | battery reply byte 3 (0x0029)       | `state == 1` (DEVICE_BATTERY_CHARGING)           |
 
-`device_class: occupancy`, so Home Assistant renders it as
+`worn` gets `device_class: occupancy` so Home Assistant renders it as
 occupied / not occupied and it drops into presence automations
-naturally.
+naturally. `charging` gets `device_class: battery_charging`.
 
 ### Text sensors (`text_sensor:`)
 

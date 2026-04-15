@@ -106,7 +106,9 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   void set_resp_rate_sensor(sensor::Sensor *s) { resp_rate_sensor_ = s; }
   void set_hrv_sensor(sensor::Sensor *s) { hrv_sensor_ = s; }
   void set_count_sensor(sensor::Sensor *s) { count_sensor_ = s; }
+  void set_battery_level_sensor(sensor::Sensor *s) { battery_sensor_ = s; }
   void set_worn_sensor(binary_sensor::BinarySensor *s) { worn_sensor_ = s; }
+  void set_charging_sensor(binary_sensor::BinarySensor *s) { charging_sensor_ = s; }
   void set_sleep_stage_sensor(text_sensor::TextSensor *s) { sleep_stage_sensor_ = s; }
   void set_activity_kind_sensor(text_sensor::TextSensor *s) { activity_kind_sensor_ = s; }
 
@@ -119,6 +121,8 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   void send_pubkey_();
   void handle_chunked_read_(const uint8_t *data, uint16_t len);
   void handle_auth_reply_(const uint8_t *payload, int len);
+  void request_battery_();
+  void handle_battery_reply_(const uint8_t *payload, int len);
   void send_session_key_();
   void begin_legacy_fetch_();
   void on_control_notify_(const uint8_t *data, uint16_t len);
@@ -151,7 +155,9 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   sensor::Sensor *resp_rate_sensor_{nullptr};
   sensor::Sensor *hrv_sensor_{nullptr};
   sensor::Sensor *count_sensor_{nullptr};
+  sensor::Sensor *battery_sensor_{nullptr};
   binary_sensor::BinarySensor *worn_sensor_{nullptr};
+  binary_sensor::BinarySensor *charging_sensor_{nullptr};
   text_sensor::TextSensor *sleep_stage_sensor_{nullptr};
   text_sensor::TextSensor *activity_kind_sensor_{nullptr};
 
@@ -168,6 +174,8 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
     bool has_hrv{false};         int hrv{0};
     bool has_worn{false};        bool worn{false};
     bool has_kind{false};        uint8_t kind{HEK_UNSET};
+    bool has_battery{false};     int battery_pct{0};
+    bool has_charging{false};    bool charging{false};
     size_t total_samples{0};
   } latest_;
 

@@ -27,6 +27,7 @@ METRICS = {
     "spo2":               (UNIT_PERCENT,          None,                     0),
     "respiratory_rate":   ("br/min",              None,                     0),
     "hrv":                ("ms",                  None,                     0),
+    "battery_level":      (UNIT_PERCENT,          None,                     0),
     "sample_count":       (UNIT_EMPTY,            None,                     0),
 }
 
@@ -58,6 +59,7 @@ SETTER = {
     "spo2":               "set_spo2_sensor",
     "respiratory_rate":   "set_resp_rate_sensor",
     "hrv":                "set_hrv_sensor",
+    "battery_level":      "set_battery_level_sensor",
     "sample_count":       "set_count_sensor",
 }
 

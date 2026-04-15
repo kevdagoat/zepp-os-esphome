@@ -78,6 +78,8 @@ sensor:
       name: "Helio Respiratory Rate"
     hrv:
       name: "Helio HRV"
+    battery_level:
+      name: "Helio Battery"
     sample_count:
       name: "Helio Last Fetch Sample Count"
 
@@ -86,6 +88,8 @@ binary_sensor:
     zepp_helio_id: zepp
     worn:
       name: "Helio Worn"
+    charging:
+      name: "Helio Charging"
 
 text_sensor:
   - platform: zepp_helio
