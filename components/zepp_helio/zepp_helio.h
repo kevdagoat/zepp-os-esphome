@@ -154,16 +154,6 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
     double max_v;
   };
 
-  struct PendingStat {
-    std::string type;      // short name (e.g. "temperature")
-    std::string start_iso; // RFC3339 UTC
-    float mean;
-    float min_v;
-    float max_v;
-    uint32_t count;
-    size_t type_idx;       // for NVS commit after all pending drained
-  };
-
   // Per-type bucket accumulator used during parse_buffer_for_type_.
   // Key: bucket start ts (seconds since epoch, aligned to BUCKET_SECONDS).
   std::map<time_t, Bucket> active_buckets_;
@@ -172,7 +162,6 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
   void flush_buckets_for_type_(uint8_t huami_code, size_t type_idx);
   void format_iso8601_utc_(time_t ts, std::string &out);
   const char *huami_type_short_name_(uint8_t huami_code);
-  void pump_pending_stats_();
   void load_last_import_ts_();
   void save_last_import_ts_(size_t idx);
   void send_session_key_();
@@ -330,9 +319,7 @@ class ZeppHelio : public Component, public ble_client::BLEClientNode {
 
   // Statistic trigger state
   std::vector<Trigger<std::string, std::string, float, float, float, uint32_t> *> stat_triggers_;
-  std::vector<PendingStat> pending_stats_;
-  size_t pending_stats_cursor_{0};
-  uint32_t last_pending_fire_ms_{0};
+  uint8_t pending_type_idx_mask_{0};  // bitmask of type indices flushed inline
 
   bool want_fetch_{false};
 

@@ -313,11 +313,6 @@ void ZeppHelio::dump_config() {
 }
 
 void ZeppHelio::loop() {
-  // Periodic state pump. BLE flow is event-driven via gattc cb; the
-  // statistic pump runs independently so it drains even while a fetch
-  // is in progress or between cycles.
-  pump_pending_stats_();
-
   // Inactivity watchdog. Any BLE event or outbound write bumps
   // last_activity_ms_; if we're non-IDLE and nothing's moved in 30 s,
   // force a disconnect + reset so the next trigger can retry.
@@ -375,10 +370,11 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
   switch (event) {
     case ESP_GATTC_OPEN_EVT:
       if (param->open.status == ESP_GATT_OK) {
-        ESP_LOGI(TAG, "BLE open ok");
-        // Request a bigger MTU post-connect. Device will reply with
-        // ESP_GATTC_CFG_MTU_EVT carrying the negotiated value.
+        ESP_LOGI(TAG, "BLE open ok, conn_id=%u", param->open.conn_id);
         esp_ble_gattc_send_mtu_req(gattc_if, param->open.conn_id);
+      } else {
+        ESP_LOGE(TAG, "BLE open FAILED status=%d", param->open.status);
+        finish_and_disconnect_(false);
       }
       break;
 
@@ -393,40 +389,53 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
       break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT: {
-      ESP_LOGI(TAG, "service discovery complete, resolving chars");
+      ESP_LOGI(TAG, "service discovery complete, resolving chars via GATT DB");
       notify_registered_count_ = 0;
-
-      // Iterate ESPHome's own service cache rather than the raw esp-idf
-      // GATT DB — recent ESPHome builds don't call esp_ble_gattc_search_
-      // service, so esp_ble_gattc_get_service returns 0 entries.
-      auto chunked_write_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000016-0000-3512-2118-0009af100700");
-      auto chunked_read_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000017-0000-3512-2118-0009af100700");
-      auto act_ctrl_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000004-0000-3512-2118-0009af100700");
-      auto act_data_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(
-          "00000005-0000-3512-2118-0009af100700");
 
       h_chunked_write_ = 0;
       h_chunked_read_  = 0;
       h_act_control_   = 0;
       h_act_data_      = 0;
 
-      auto &svc_list = this->parent()->services_;
-      ESP_LOGI(TAG, "cached services: %u", (unsigned) svc_list.size());
-      for (auto *svc : svc_list) {
-        ESP_LOGI(TAG, "  svc %s  h=%u..%u",
-                 svc->uuid.to_string().c_str(),
-                 svc->start_handle, svc->end_handle);
-        for (auto *chr : svc->characteristics) {
-          ESP_LOGD(TAG, "    chr %s  h=%u props=0x%02X",
-                   chr->uuid.to_string().c_str(),
-                   chr->handle, chr->properties);
-          if (chr->uuid == chunked_write_uuid) h_chunked_write_ = chr->handle;
-          else if (chr->uuid == chunked_read_uuid) h_chunked_read_ = chr->handle;
-          else if (chr->uuid == act_ctrl_uuid)  h_act_control_   = chr->handle;
-          else if (chr->uuid == act_data_uuid)  h_act_data_      = chr->handle;
+      // Query the full GATT database directly from ESP-IDF rather than
+      // relying on ESPHome's service cache (which may not populate
+      // characteristics in newer versions).
+      uint16_t conn_id = this->parent()->get_conn_id();
+      uint16_t count = 128;  // max entries to retrieve
+      std::vector<esp_gattc_db_elem_t> db(count);
+      esp_gatt_status_t st = esp_ble_gattc_get_db(
+          gattc_if, conn_id, 0x0001, 0xFFFF, db.data(), &count);
+      ESP_LOGI(TAG, "GATT DB returned %u entries (status=%d)", (unsigned) count, st);
+
+      if (st == ESP_GATT_OK && count > 0) {
+        // Target 128-bit UUIDs we need (little-endian byte order for ESP-IDF)
+        // 0000XXXX-0000-3512-2118-0009af100700
+        // In LE bytes: 00 07 10 af 09 00 18 21 12 35 00 00 XX XX 00 00
+        static const uint8_t base_le[] = {
+          0x00, 0x07, 0x10, 0xaf, 0x09, 0x00, 0x18, 0x21,
+          0x12, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
+
+        for (uint16_t i = 0; i < count; i++) {
+          auto &e = db[i];
+          if (e.type == ESP_GATT_DB_CHARACTERISTIC &&
+              e.uuid.len == ESP_UUID_LEN_128) {
+            // Extract the 16-bit short ID from bytes 12-13 (LE)
+            uint16_t short_id = e.uuid.uuid.uuid128[12] |
+                                (e.uuid.uuid.uuid128[13] << 8);
+            // Verify base matches
+            bool base_ok = (std::memcmp(e.uuid.uuid.uuid128, base_le, 12) == 0 &&
+                            e.uuid.uuid.uuid128[14] == 0x00 &&
+                            e.uuid.uuid.uuid128[15] == 0x00);
+            if (base_ok) {
+              ESP_LOGD(TAG, "  chr short=0x%04X  h=%u props=0x%02X",
+                       short_id, e.attribute_handle, e.properties);
+              if (short_id == 0x0016) h_chunked_write_ = e.attribute_handle;
+              else if (short_id == 0x0017) h_chunked_read_ = e.attribute_handle;
+              else if (short_id == 0x0004) h_act_control_ = e.attribute_handle;
+              else if (short_id == 0x0005) h_act_data_ = e.attribute_handle;
+            }
+          }
         }
       }
 
@@ -503,6 +512,7 @@ void ZeppHelio::gattc_event_handler(esp_gattc_cb_event_t event,
       break;
 
     default:
+      ESP_LOGD(TAG, "unhandled gattc event %d", (int) event);
       break;
   }
 }
@@ -1092,9 +1102,8 @@ void ZeppHelio::parse_buffer_for_type_(uint8_t type,
   latest_.total_samples += count;
   last_seen_[current_type_idx_] = newest_ts;
   flush_buckets_for_type_(type, current_type_idx_);
-  ESP_LOGI(TAG, "type 0x%02X: parsed %u samples, last_seen=%ld, pending=%u",
-           type, (unsigned) count, (long) newest_ts,
-           (unsigned) pending_stats_.size());
+  ESP_LOGI(TAG, "type 0x%02X: parsed %u samples, last_seen=%ld",
+           type, (unsigned) count, (long) newest_ts);
 }
 
 void ZeppHelio::publish_latest_() {
@@ -1120,6 +1129,14 @@ void ZeppHelio::publish_latest_() {
 void ZeppHelio::finish_and_disconnect_(bool ok) {
   ESP_LOGI(TAG, "fetch %s, total %u samples across types",
            ok ? "ok" : "FAIL", (unsigned) latest_.total_samples);
+  // Commit NVS for any type indices that were flushed inline.
+  for (size_t i = 0; i < 8; i++) {
+    if (pending_type_idx_mask_ & (1u << i)) {
+      last_import_ts_[i] = (uint32_t) last_seen_[i];
+      save_last_import_ts_(i);
+    }
+  }
+  pending_type_idx_mask_ = 0;
   state_ = State::IDLE;
   have_session_ = false;
   this->parent()->disconnect();
@@ -1196,60 +1213,26 @@ void ZeppHelio::flush_buckets_for_type_(uint8_t huami_code, size_t type_idx) {
     return;
   }
   const char *name = huami_type_short_name_(huami_code);
+  // Fire triggers directly instead of buffering into a vector.
+  // On first-run backfill (24h) this can be 288 buckets per type —
+  // buffering all of them as PendingStat (with std::string members)
+  // exhausts the ESP32-C3's ~300KB heap.
+  std::string iso_buf;
   for (auto &kv : active_buckets_) {
     const Bucket &b = kv.second;
-    PendingStat s;
-    s.type = name;
-    format_iso8601_utc_(b.start_ts, s.start_iso);
-    s.mean = (float) (b.sum / (double) b.count);
-    s.min_v = (float) b.min_v;
-    s.max_v = (float) b.max_v;
-    s.count = b.count;
-    s.type_idx = type_idx;
-    pending_stats_.push_back(std::move(s));
+    format_iso8601_utc_(b.start_ts, iso_buf);
+    float mean = (float) (b.sum / (double) b.count);
+    float min_v = (float) b.min_v;
+    float max_v = (float) b.max_v;
+    for (auto *t : stat_triggers_) {
+      t->trigger(std::string(name), iso_buf, mean, min_v, max_v, b.count);
+    }
   }
+  // Record last-seen for NVS commit after all types finish.
+  pending_type_idx_mask_ |= (1u << type_idx);
   active_buckets_.clear();
 }
 
-// ---- Statistic pump -----------------------------------------------------
-
-void ZeppHelio::pump_pending_stats_() {
-  if (stat_triggers_.empty()) {
-    pending_stats_.clear();
-    pending_stats_cursor_ = 0;
-    return;
-  }
-  if (pending_stats_cursor_ >= pending_stats_.size()) {
-    if (!pending_stats_.empty()) {
-      // Queue just drained → commit every type_idx we touched to NVS.
-      // We keep a simple set via an on-stack array.
-      std::array<bool, 8> touched{};
-      for (auto &p : pending_stats_) {
-        if (p.type_idx < touched.size()) touched[p.type_idx] = true;
-      }
-      for (size_t i = 0; i < touched.size(); i++) {
-        if (touched[i]) {
-          last_import_ts_[i] = (uint32_t) last_seen_[i];
-          save_last_import_ts_(i);
-        }
-      }
-      pending_stats_.clear();
-      pending_stats_cursor_ = 0;
-    }
-    return;
-  }
-
-  // Throttle: fire at most one bucket per 100 ms across all triggers.
-  // Keeps HA's API queue from backing up during a 24 h first-run dump.
-  uint32_t now_ms = millis();
-  if (now_ms - last_pending_fire_ms_ < 100) return;
-  last_pending_fire_ms_ = now_ms;
-
-  PendingStat &s = pending_stats_[pending_stats_cursor_++];
-  for (auto *t : stat_triggers_) {
-    t->trigger(s.type, s.start_iso, s.mean, s.min_v, s.max_v, s.count);
-  }
 }
 
 }  // namespace zepp_helio
-}  // namespace esphome
